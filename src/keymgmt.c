@@ -123,6 +123,9 @@ struct key_generator {
             CK_ULONG ec_params_size;
         } ec;
     } data;
+
+    OSSL_CALLBACK *cb_fn;
+    void *cb_arg;
 };
 
 static void *p11prov_common_gen_init(void *provctx, int selection,
@@ -136,7 +139,7 @@ static void *p11prov_common_gen_init(void *provctx, int selection,
 
     P11PROV_debug("rsa gen_init %p", provctx);
 
-    ret = p11prov_ctx_status(provctx, NULL);
+    ret = p11prov_ctx_status(provctx);
     if (ret != CKR_OK) {
         return NULL;
     }
@@ -280,10 +283,33 @@ static int p11prov_common_gen_set_params(void *genctx,
     return RET_OSSL_OK;
 }
 
+static CK_RV common_gen_callback(void *cbarg)
+{
+    struct key_generator *ctx = (struct key_generator *)cbarg;
+    OSSL_PARAM params[] = { OSSL_PARAM_END, OSSL_PARAM_END, OSSL_PARAM_END };
+    int data = 0;
+    int ret;
+
+    if (!ctx->cb_fn) {
+        return CKR_OK;
+    }
+
+    params[0] = OSSL_PARAM_construct_int(OSSL_GEN_PARAM_POTENTIAL, &data);
+    params[1] = OSSL_PARAM_construct_int(OSSL_GEN_PARAM_ITERATION, &data);
+
+    ret = ctx->cb_fn(params, ctx->cb_arg);
+    if (ret != RET_OSSL_OK) {
+        return CKR_CANCEL;
+    }
+
+    return CKR_OK;
+}
+
 static void *p11prov_common_gen(struct key_generator *ctx,
                                 CK_ATTRIBUTE *pubkey_template,
                                 CK_ATTRIBUTE *privkey_template, int pubtsize,
-                                int privtsize)
+                                int privtsize, OSSL_CALLBACK *cb_fn,
+                                void *cb_arg)
 {
     CK_SLOT_ID slotid = CK_UNAVAILABLE_INFORMATION;
     CK_BYTE id[16];
@@ -294,19 +320,20 @@ static void *p11prov_common_gen(struct key_generator *ctx,
     P11PROV_SESSION *session = NULL;
     CK_SESSION_HANDLE sh;
     P11PROV_OBJ *key = NULL;
-    CK_FUNCTION_LIST *f;
     CK_RV ret;
 
-    ret = p11prov_ctx_status(ctx->provctx, &f);
+    /* FIXME: how do we get a URI to select the right slot ? */
+    ret = p11prov_get_session(ctx->provctx, &slotid, NULL, NULL,
+                              ctx->mechanism.mechanism, NULL, NULL, true, true,
+                              &session);
     if (ret != CKR_OK) {
         return NULL;
     }
 
-    /* FIXME: how do we get a URI to select the right slot ? */
-    ret = p11prov_get_session(ctx->provctx, &slotid, NULL, NULL, NULL, NULL,
-                              true, true, &session);
-    if (ret != CKR_OK) {
-        return NULL;
+    if (cb_fn) {
+        ctx->cb_fn = cb_fn;
+        ctx->cb_arg = cb_arg;
+        p11prov_session_set_callback(session, common_gen_callback, ctx);
     }
 
     sh = p11prov_session_handle(session);
@@ -316,9 +343,9 @@ static void *p11prov_common_gen(struct key_generator *ctx,
         id_len = ctx->id_len;
     } else {
         /* generate unique id for the key */
-        ret = f->C_GenerateRandom(sh, id, sizeof(id));
+        ret = p11prov_GenerateRandom(ctx->provctx, sh, id, sizeof(id));
         if (ret != CKR_OK) {
-            p11prov_session_free(session);
+            p11prov_return_session(session);
             return NULL;
         }
         id_ptr = id;
@@ -344,20 +371,21 @@ static void *p11prov_common_gen(struct key_generator *ctx,
         privtsize++;
     }
 
-    ret = f->C_GenerateKeyPair(sh, &ctx->mechanism, pubkey_template, pubtsize,
-                               privkey_template, privtsize, &pubkey, &privkey);
+    ret = p11prov_GenerateKeyPair(ctx->provctx, sh, &ctx->mechanism,
+                                  pubkey_template, pubtsize, privkey_template,
+                                  privtsize, &pubkey, &privkey);
     if (ret != CKR_OK) {
-        p11prov_session_free(session);
+        p11prov_return_session(session);
         return NULL;
     }
 
     ret = p11prov_obj_from_handle(ctx->provctx, session, privkey, &key);
     if (ret != CKR_OK) {
-        p11prov_session_free(session);
+        p11prov_return_session(session);
         return NULL;
     }
 
-    p11prov_session_free(session);
+    p11prov_return_session(session);
     return key;
 }
 
@@ -365,7 +393,7 @@ static void p11prov_common_gen_cleanup(void *genctx)
 {
     struct key_generator *ctx = (struct key_generator *)genctx;
 
-    P11PROV_debug("rsa gen_cleanup %p", genctx);
+    P11PROV_debug("common gen_cleanup %p", genctx);
 
     if (ctx->label) {
         OPENSSL_free(ctx->label);
@@ -398,11 +426,12 @@ static void *p11prov_rsa_gen(void *genctx, OSSL_CALLBACK *cb_fn, void *cb_arg)
     /* CK_BBOOL val_false = CK_FALSE; */
 
     /* always leave space for CKA_ID and CKA_LABEL */
-#define RSA_PUBKEY_TMPL_SIZE 5
+#define RSA_PUBKEY_TMPL_SIZE 6
     CK_ATTRIBUTE pubkey_template[RSA_PUBKEY_TMPL_SIZE + 2] = {
         { CKA_ENCRYPT, &val_true, sizeof(val_true) },
         { CKA_VERIFY, &val_true, sizeof(val_true) },
         { CKA_WRAP, &val_true, sizeof(val_true) },
+        { CKA_TOKEN, &val_true, sizeof(CK_BBOOL) },
         { CKA_MODULUS_BITS, &ctx->data.rsa.modulus_bits,
           sizeof(ctx->data.rsa.modulus_bits) },
         { CKA_PUBLIC_EXPONENT, &ctx->data.rsa.exponent,
@@ -427,7 +456,7 @@ static void *p11prov_rsa_gen(void *genctx, OSSL_CALLBACK *cb_fn, void *cb_arg)
     P11PROV_debug("rsa gen %p %p %p", genctx, cb_fn, cb_arg);
 
     return p11prov_common_gen(ctx, pubkey_template, privkey_template, pubtsize,
-                              privtsize);
+                              privtsize, cb_fn, cb_arg);
 }
 
 static const OSSL_PARAM *p11prov_rsa_gen_settable_params(void *genctx,
@@ -472,7 +501,7 @@ static void *p11prov_rsa_load(const void *reference, size_t reference_sz)
         type = p11prov_obj_get_key_type(key);
         if (type == CKK_RSA) {
             /* add ref count */
-            key = p11prov_obj_ref(key);
+            key = p11prov_obj_ref_no_cache(key);
         } else {
             key = NULL;
         }
@@ -518,10 +547,15 @@ static int p11prov_rsa_export(void *keydata, int selection,
                               OSSL_CALLBACK *cb_fn, void *cb_arg)
 {
     P11PROV_OBJ *key = (P11PROV_OBJ *)keydata;
+    P11PROV_CTX *ctx = p11prov_obj_get_prov_ctx(key);
 
     P11PROV_debug("rsa export %p", keydata);
 
     if (key == NULL) {
+        return RET_OSSL_ERR;
+    }
+
+    if (p11prov_ctx_allow_export(ctx) & DISALLOW_EXPORT_PUBLIC) {
         return RET_OSSL_ERR;
     }
 
@@ -843,8 +877,9 @@ static void *p11prov_ec_gen(void *genctx, OSSL_CALLBACK *cb_fn, void *cb_arg)
     /* CK_BBOOL val_false = CK_FALSE; */
 
     /* always leave space for CKA_ID and CKA_LABEL */
-#define EC_PUBKEY_TMPL_SIZE 4
+#define EC_PUBKEY_TMPL_SIZE 5
     CK_ATTRIBUTE pubkey_template[EC_PUBKEY_TMPL_SIZE + 2] = {
+        { CKA_TOKEN, &val_true, sizeof(CK_BBOOL) },
         { CKA_DERIVE, &val_true, sizeof(val_true) },
         { CKA_VERIFY, &val_true, sizeof(val_true) },
         { CKA_WRAP, &val_true, sizeof(val_true) },
@@ -869,7 +904,7 @@ static void *p11prov_ec_gen(void *genctx, OSSL_CALLBACK *cb_fn, void *cb_arg)
     P11PROV_debug("ec gen %p %p %p", ctx, cb_fn, cb_arg);
 
     return p11prov_common_gen(ctx, pubkey_template, privkey_template, pubtsize,
-                              privtsize);
+                              privtsize, cb_fn, cb_arg);
 }
 
 static const OSSL_PARAM *p11prov_ec_gen_settable_params(void *genctx,
@@ -892,10 +927,25 @@ static void p11prov_ec_free(void *key)
 
 static void *p11prov_ec_load(const void *reference, size_t reference_sz)
 {
+    P11PROV_OBJ *key;
+
     P11PROV_debug("ec load %p, %ld", reference, reference_sz);
 
     /* the contents of the reference is the address to our object */
-    return p11prov_obj_from_reference(reference, reference_sz);
+    key = p11prov_obj_from_reference(reference, reference_sz);
+    if (key) {
+        CK_KEY_TYPE type = CK_UNAVAILABLE_INFORMATION;
+
+        type = p11prov_obj_get_key_type(key);
+        if (type == CKK_EC) {
+            /* add ref count */
+            key = p11prov_obj_ref_no_cache(key);
+        } else {
+            key = NULL;
+        }
+    }
+
+    return key;
 }
 
 static int p11prov_ec_has(const void *keydata, int selection)
@@ -932,10 +982,15 @@ static int p11prov_ec_export(void *keydata, int selection, OSSL_CALLBACK *cb_fn,
                              void *cb_arg)
 {
     P11PROV_OBJ *key = (P11PROV_OBJ *)keydata;
+    P11PROV_CTX *ctx = p11prov_obj_get_prov_ctx(key);
 
     P11PROV_debug("ec export %p", keydata);
 
     if (key == NULL) {
+        return RET_OSSL_ERR;
+    }
+
+    if (p11prov_ctx_allow_export(ctx) & DISALLOW_EXPORT_PUBLIC) {
         return RET_OSSL_ERR;
     }
 
@@ -1015,16 +1070,14 @@ static int p11prov_ec_get_params(void *keydata, OSSL_PARAM params[])
         return RET_OSSL_ERR;
     }
 
-    group_size = p11prov_obj_get_key_size(key);
+    group_size = p11prov_obj_get_key_bit_size(key);
     if (group_size == CK_UNAVAILABLE_INFORMATION) {
         return RET_OSSL_ERR;
     }
 
     p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_BITS);
     if (p) {
-        /* TODO: may want to try to get CKA_MODULUS_BITS,
-         * and fallback only if unavailable */
-        ret = OSSL_PARAM_set_int(p, group_size * 8);
+        ret = OSSL_PARAM_set_int(p, group_size);
         if (ret != RET_OSSL_OK) {
             return ret;
         }
@@ -1032,7 +1085,7 @@ static int p11prov_ec_get_params(void *keydata, OSSL_PARAM params[])
     p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_SECURITY_BITS);
     if (p) {
         /* TODO: as above, plus use log() for intermediate values */
-        int secbits = p11prov_ec_secbits(group_size * 8);
+        int secbits = p11prov_ec_secbits(group_size);
         ret = OSSL_PARAM_set_int(p, secbits);
         if (ret != RET_OSSL_OK) {
             return ret;
@@ -1040,7 +1093,20 @@ static int p11prov_ec_get_params(void *keydata, OSSL_PARAM params[])
     }
     p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_MAX_SIZE);
     if (p) {
-        ret = OSSL_PARAM_set_int(p, group_size * 2);
+        /* add room for ECDSA Signature DER overhead */
+        CK_ULONG size = p11prov_obj_get_key_size(key);
+        ret = OSSL_PARAM_set_int(p, 3 + (size + 4) * 2);
+        if (ret != RET_OSSL_OK) {
+            return ret;
+        }
+    }
+    p = OSSL_PARAM_locate(params, OSSL_PKEY_PARAM_GROUP_NAME);
+    if (p) {
+        const char *curve_name = p11prov_obj_get_ec_group_name(key);
+        if (curve_name == NULL) {
+            return RET_OSSL_ERR;
+        }
+        ret = OSSL_PARAM_set_utf8_string(p, curve_name);
         if (ret != RET_OSSL_OK) {
             return ret;
         }
@@ -1055,10 +1121,10 @@ static const OSSL_PARAM *p11prov_ec_gettable_params(void *provctx)
         OSSL_PARAM_int(OSSL_PKEY_PARAM_BITS, NULL),
         OSSL_PARAM_int(OSSL_PKEY_PARAM_SECURITY_BITS, NULL),
         OSSL_PARAM_int(OSSL_PKEY_PARAM_MAX_SIZE, NULL),
+        OSSL_PARAM_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME, NULL, 0),
         /* OSSL_PKEY_PARAM_DEFAULT_DIGEST
          * OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY
          * OSSL_PKEY_PARAM_EC_DECODED_FROM_EXPLICIT_PARAM
-         * OSSL_PKEY_PARAM_GROUP_NAME
          * OSSL_PKEY_PARAM_EC_ENCODING
          * OSSL_PKEY_PARAM_EC_POINT_CONVERSION_FORMAT
          * OSSL_PKEY_PARAM_EC_FIELD_TYPE

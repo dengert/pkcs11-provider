@@ -35,7 +35,7 @@ static void *p11prov_hkdf_newctx(void *provctx)
 
     P11PROV_debug("hkdf newctx");
 
-    ret = p11prov_ctx_status(ctx, NULL);
+    ret = p11prov_ctx_status(ctx);
     if (ret != CKR_OK) {
         return RET_OSSL_ERR;
     }
@@ -72,7 +72,7 @@ static void p11prov_hkdf_reset(void *ctx)
     /* free all allocated resources */
     p11prov_obj_free(hkdfctx->key);
     if (hkdfctx->session) {
-        p11prov_session_free(hkdfctx->session);
+        p11prov_return_session(hkdfctx->session);
         hkdfctx->session = NULL;
     }
 
@@ -109,6 +109,7 @@ static int p11prov_hkdf_derive(void *ctx, unsigned char *key, size_t keylen,
     CK_SLOT_ID slotid;
     unsigned long dkey_len;
     struct fetch_attrs attrs[1];
+    int num = 0;
     CK_RV ret;
 
     P11PROV_debug("hkdf derive (ctx:%p, key:%p[%zu], params:%p)", ctx, key,
@@ -154,9 +155,9 @@ static int p11prov_hkdf_derive(void *ctx, unsigned char *key, size_t keylen,
     }
 
     P11PROV_debug("HKDF derived hey handle: %lu", dkey_handle);
-    FA_ASSIGN_ALL(attrs[0], CKA_VALUE, &key, &dkey_len, false, true);
+    FA_SET_BUF_VAL(attrs, num, CKA_VALUE, key, dkey_len, false, true);
     ret = p11prov_fetch_attributes(hkdfctx->provctx, hkdfctx->session,
-                                   dkey_handle, attrs, 1);
+                                   dkey_handle, attrs, num);
     if (ret != CKR_OK) {
         P11PROV_debug("hkdf failed to retrieve secret %lu", ret);
         return RET_OSSL_ERR;
@@ -251,9 +252,9 @@ static int p11prov_hkdf_set_ctx_params(void *ctx, const OSSL_PARAM params[])
 
         /* Create Session  and key from key material */
         if (hkdfctx->session == NULL) {
-            ret =
-                p11prov_get_session(hkdfctx->provctx, &slotid, NULL, NULL, NULL,
-                                    NULL, false, false, &hkdfctx->session);
+            ret = p11prov_get_session(hkdfctx->provctx, &slotid, NULL, NULL,
+                                      hkdfctx->mechtype, NULL, NULL, false,
+                                      false, &hkdfctx->session);
             if (ret != CKR_OK) {
                 return RET_OSSL_ERR;
             }

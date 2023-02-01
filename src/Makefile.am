@@ -1,7 +1,26 @@
 
 AM_CFLAGS = $(STD_CFLAGS)
 
-noinst_HEADERS = pkcs11.h provider.h
+noinst_HEADERS = \
+	asymmetric_cipher.h \
+	debug.h \
+	encoder.h \
+	digests.h \
+	exchange.h \
+	kdf.h \
+	keymgmt.h \
+	interface.h \
+	oasis/pkcs11.h \
+	oasis/pkcs11f.h \
+	oasis/pkcs11t.h \
+	objects.h \
+	pkcs11.h \
+	platform/endian.h \
+	provider.h \
+	session.h \
+	signature.h \
+	store.h \
+	util.h
 pkcs11_LTLIBRARIES = pkcs11.la
 
 SHARED_EXT=@SHARED_EXT@
@@ -16,12 +35,8 @@ pkcs11_la_SOURCES = \
 	exchange.c \
 	kdf.c \
 	keymgmt.c \
-	oasis/pkcs11.h \
-	oasis/pkcs11f.h \
-	oasis/pkcs11t.h \
+	interface.c \
 	objects.c \
-	pkcs11.h \
-	platform/endian.h \
 	provider.h \
 	provider.c \
 	session.c \
@@ -30,6 +45,11 @@ pkcs11_la_SOURCES = \
 	tls.c \
 	util.c \
 	provider.exports \
+	$(NULL)
+
+EXTRA_DIST = \
+	interface.gen.c \
+	encoder.gen.c \
 	$(NULL)
 
 pkcs11_la_CFLAGS = $(AM_CFLAGS) $(OPENSSL_CFLAGS) -Wall -Werror

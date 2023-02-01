@@ -6,7 +6,7 @@
 #include "provider.h"
 #include <string.h>
 
-int debug_lazy_init = 0;
+int debug_level = -1;
 FILE *stddebug = NULL;
 
 /* this function relies on being called by P11PROV_debug, after
@@ -21,54 +21,58 @@ void p11prov_debug_init(void)
      * break tokenization, we do not provide any escaping, kiss */
     const char *env = getenv("PKCS11_PROVIDER_DEBUG");
     const char *next;
-    int dbg_level = 1;
+    char fname[1024];
+    int dbg_level = 0;
+    int orig;
     if (env) {
         do {
             next = strchr(env, ',');
             if (strncmp(env, "file:", 5) == 0) {
+                int len;
                 if (stddebug != NULL && stddebug != stderr) {
                     fclose(stddebug);
                 }
                 if (next) {
-                    char *fname = strndup(env + 5, next - env - 5);
-                    if (fname == NULL) {
-                        return;
-                    }
-                    stddebug = fopen(fname, "a");
-                    free(fname);
-                    env = next + 1;
+                    len = next - env - 5;
                 } else {
-                    stddebug = fopen(env + 5, "a");
+                    len = strlen(env + 5);
                 }
+                memcpy(fname, env + 5, len);
+                fname[len] = '\0';
+                stddebug = fopen(fname, "a");
                 if (stddebug == NULL) {
-                    return;
+                    goto done;
                 }
             } else if (strncmp(env, "level:", 6) == 0) {
                 dbg_level = atoi(env + 6);
-                if (dbg_level < 1) {
-                    dbg_level = 1;
-                }
-                if (next) {
-                    env = next + 1;
-                }
+            }
+            if (next) {
+                env = next + 1;
             }
         } while (next);
 
-        if (stddebug == NULL) {
-            stddebug = stderr;
+        if (dbg_level < 1) {
+            dbg_level = 1;
         }
-        int enable = dbg_level;
-        int orig;
-        /* set enable value to debug_lazy_init atomically */
-        __atomic_exchange(&debug_lazy_init, &enable, &orig, __ATOMIC_SEQ_CST);
     }
+
+done:
+    /* set value to debug_level atomically */
+    __atomic_exchange(&debug_level, &dbg_level, &orig, __ATOMIC_SEQ_CST);
 }
 
-void p11prov_debug(const char *fmt, ...)
+void p11prov_debug(const char *file, int line, const char *func,
+                   const char *fmt, ...)
 {
     const char newline[] = "\n";
     va_list args;
 
+    if (file) {
+        fprintf(stddebug, "[%s:%d] ", file, line);
+    }
+    if (func) {
+        fprintf(stddebug, "%s(): ", func);
+    }
     va_start(args, fmt);
     vfprintf(stddebug, fmt, args);
     va_end(args);
@@ -87,16 +91,10 @@ void p11prov_debug_mechanism(P11PROV_CTX *ctx, CK_SLOT_ID slotid,
                              CK_MECHANISM_TYPE type)
 {
     CK_MECHANISM_INFO info = { 0 };
-    CK_FUNCTION_LIST *f;
     const char *mechname = "UNKNOWN";
     CK_RV ret;
 
-    if (debug_lazy_init < 1) {
-        return;
-    }
-
-    ret = p11prov_ctx_status(ctx, &f);
-    if (ret != CKR_OK) {
+    if (debug_level < 1) {
         return;
     }
 
@@ -106,21 +104,24 @@ void p11prov_debug_mechanism(P11PROV_CTX *ctx, CK_SLOT_ID slotid,
         }
     }
 
-    ret = f->C_GetMechanismInfo(slotid, type, &info);
+    ret = p11prov_GetMechanismInfo(ctx, slotid, type, &info);
     if (ret != CKR_OK) {
-        p11prov_debug("C_GetMechanismInfo for %s(%lu) failed %lu\n", mechname,
+        p11prov_debug(NULL, 0, NULL,
+                      "C_GetMechanismInfo for %s(%lu) failed %lu\n", mechname,
                       type, ret);
     } else {
-        p11prov_debug(
-            "Mechanism Info:\n"
-            "  name: %s (%lu):\n"
-            "  min key length: %lu\n"
-            "  max key length: %lu\n"
-            "  flags (%#08lx):\n",
-            mechname, type, info.ulMinKeySize, info.ulMaxKeySize, info.flags);
+        p11prov_debug(NULL, 0, NULL,
+                      "Mechanism Info:\n"
+                      "  name: %s (%lu):\n"
+                      "  min key length: %lu\n"
+                      "  max key length: %lu\n"
+                      "  flags (%#08lx):\n",
+                      mechname, type, info.ulMinKeySize, info.ulMaxKeySize,
+                      info.flags);
         for (int i = 0; mechanism_flags[i].name != NULL; i++) {
             if (info.flags & mechanism_flags[i].value) {
-                p11prov_debug("    %-25s (%#08lx)", mechanism_flags[i].name,
+                p11prov_debug(NULL, 0, NULL, "    %-25s (%#08lx)",
+                              mechanism_flags[i].name,
                               mechanism_flags[i].value);
             }
         }
@@ -131,86 +132,88 @@ extern struct ckmap token_flags[];
 
 static void p11prov_debug_token_info(CK_TOKEN_INFO *info)
 {
-    p11prov_debug(
-        "Token Info:\n"
-        "  Label:            [%.32s]\n"
-        "  Manufacturer ID:  [%.32s]\n"
-        "  Model:            [%.16s]\n"
-        "  Serial Number:    [%.16s]\n"
-        "  Flags (%#08lx):\n",
-        info->label, info->manufacturerID, info->model, info->serialNumber,
-        info->flags);
+    p11prov_debug(NULL, 0, NULL,
+                  "Token Info:\n"
+                  "  Label:            [%.32s]\n"
+                  "  Manufacturer ID:  [%.32s]\n"
+                  "  Model:            [%.16s]\n"
+                  "  Serial Number:    [%.16s]\n"
+                  "  Flags (%#08lx):\n",
+                  info->label, info->manufacturerID, info->model,
+                  info->serialNumber, info->flags);
     for (int i = 0; token_flags[i].name != NULL; i++) {
         if (info->flags & token_flags[i].value) {
-            p11prov_debug("    %-35s (%#08lx)", token_flags[i].name,
-                          token_flags[i].value);
+            p11prov_debug(NULL, 0, NULL, "    %-35s (%#08lx)",
+                          token_flags[i].name, token_flags[i].value);
         }
     }
-    p11prov_debug(
-        "  Session Count      Max: %3lu  Current: %3lu\n"
-        "  R/W Session Count  Max: %3lu  Current: %3lu\n"
-        "  Pin Len Range: %lu-%lu\n"
-        "  Public  Memory  Total: %6lu  Free: %6lu\n"
-        "  Private Memory  Total: %6lu  Free: %6lu\n"
-        "  Hardware Version: %d.%d\n"
-        "  Firmware Version: %d.%d\n"
-        "  UTC Time: [%.16s]\n",
-        info->ulMaxSessionCount, info->ulSessionCount,
-        info->ulMaxRwSessionCount, info->ulRwSessionCount, info->ulMinPinLen,
-        info->ulMaxPinLen, info->ulTotalPublicMemory, info->ulFreePublicMemory,
-        info->ulTotalPrivateMemory, info->ulFreePrivateMemory,
-        info->hardwareVersion.major, info->hardwareVersion.minor,
-        info->firmwareVersion.major, info->firmwareVersion.minor,
-        info->utcTime);
+    p11prov_debug(NULL, 0, NULL,
+                  "  Session Count      Max: %3lu  Current: %3lu\n"
+                  "  R/W Session Count  Max: %3lu  Current: %3lu\n"
+                  "  Pin Len Range: %lu-%lu\n"
+                  "  Public  Memory  Total: %6lu  Free: %6lu\n"
+                  "  Private Memory  Total: %6lu  Free: %6lu\n"
+                  "  Hardware Version: %d.%d\n"
+                  "  Firmware Version: %d.%d\n"
+                  "  UTC Time: [%.16s]\n",
+                  info->ulMaxSessionCount, info->ulSessionCount,
+                  info->ulMaxRwSessionCount, info->ulRwSessionCount,
+                  info->ulMinPinLen, info->ulMaxPinLen,
+                  info->ulTotalPublicMemory, info->ulFreePublicMemory,
+                  info->ulTotalPrivateMemory, info->ulFreePrivateMemory,
+                  info->hardwareVersion.major, info->hardwareVersion.minor,
+                  info->firmwareVersion.major, info->firmwareVersion.minor,
+                  info->utcTime);
 }
 
 extern struct ckmap slot_flags[];
 extern struct ckmap profile_ids[];
 
-void p11prov_debug_slot(P11PROV_CTX *ctx, struct p11prov_slot *slot)
+void p11prov_debug_slot(P11PROV_CTX *ctx, CK_SLOT_ID slotid, CK_SLOT_INFO *slot,
+                        CK_TOKEN_INFO *token, CK_MECHANISM_TYPE *mechs,
+                        CK_ULONG mechs_num, CK_ULONG *profiles)
 {
-    p11prov_debug(
-        "Slot Info:\n"
-        "  ID: %lu\n"
-        "  Description:      [%.64s]\n"
-        "  Manufacturer ID:  [%.32s]\n"
-        "  Flags (%#08lx):\n",
-        slot->id, slot->slot.slotDescription, slot->slot.manufacturerID,
-        slot->slot.flags);
+    p11prov_debug(NULL, 0, NULL,
+                  "Slot Info:\n"
+                  "  ID: %lu\n"
+                  "  Description:      [%.64s]\n"
+                  "  Manufacturer ID:  [%.32s]\n"
+                  "  Flags (%#08lx):\n",
+                  slotid, slot->slotDescription, slot->manufacturerID,
+                  slot->flags);
     for (int i = 0; slot_flags[i].name != NULL; i++) {
-        if (slot->slot.flags & slot_flags[i].value) {
-            p11prov_debug("    %-25s (%#08lx)", slot_flags[i].name,
-                          slot_flags[i].value);
+        if (slot->flags & slot_flags[i].value) {
+            p11prov_debug(NULL, 0, NULL, "    %-25s (%#08lx)",
+                          slot_flags[i].name, slot_flags[i].value);
         }
     }
-    p11prov_debug(
-        "  Hardware Version: %d.%d\n"
-        "  Firmware Version: %d.%d\n",
-        slot->slot.hardwareVersion.major, slot->slot.hardwareVersion.minor,
-        slot->slot.firmwareVersion.major, slot->slot.firmwareVersion.minor);
-    if (slot->slot.flags & CKF_TOKEN_PRESENT) {
-        p11prov_debug_token_info(&slot->token);
+    p11prov_debug(NULL, 0, NULL,
+                  "  Hardware Version: %d.%d\n"
+                  "  Firmware Version: %d.%d\n",
+                  slot->hardwareVersion.major, slot->hardwareVersion.minor,
+                  slot->firmwareVersion.major, slot->firmwareVersion.minor);
+    if (slot->flags & CKF_TOKEN_PRESENT) {
+        p11prov_debug_token_info(token);
     }
 
-    if (debug_lazy_init > 1) {
-        for (CK_ULONG i = 0; i < slot->mechs_num; i++) {
-            p11prov_debug_mechanism(ctx, slot->id, slot->mechs[i]);
+    if (debug_level > 1) {
+        for (CK_ULONG i = 0; i < mechs_num; i++) {
+            p11prov_debug_mechanism(ctx, slotid, mechs[i]);
         }
     }
 
-    if (slot->profiles[0] != CKP_INVALID_ID) {
-        p11prov_debug("  Available profiles:\n");
+    if (profiles[0] != CKP_INVALID_ID) {
+        p11prov_debug(NULL, 0, NULL, "  Available profiles:\n");
         for (int c = 0; c < 5; c++) {
-            CK_ULONG profile = slot->profiles[c];
             for (int i = 0; profile_ids[i].name != NULL; i++) {
-                if (profile == slot_flags[i].value) {
-                    p11prov_debug("    %-35s (%#08lx)", profile_ids[i].name,
-                                  profile_ids[i].value);
+                if (profiles[c] == slot_flags[i].value) {
+                    p11prov_debug(NULL, 0, NULL, "    %-35s (%#08lx)",
+                                  profile_ids[i].name, profile_ids[i].value);
                 }
             }
         }
     } else {
-        p11prov_debug("  No profiles specified\n");
+        p11prov_debug(NULL, 0, NULL, "  No profiles specified\n");
     }
 }
 

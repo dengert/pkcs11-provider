@@ -1,7 +1,7 @@
 #                                               -*- Autoconf -*-
 # Process this file with autoconf to produce a configure script.
 
-AC_PREREQ([2.71])
+AC_PREREQ([2.69])
 AC_INIT([pkcs11-provider], [0.1], [simo@redhat.com])
 AC_CONFIG_SRCDIR([src/provider.c])
 AC_CONFIG_HEADERS([src/config.h])
@@ -39,13 +39,37 @@ AX_CHECK_COMPILE_FLAG([-fdiagnostics-show-option],
 
 AC_SUBST([STD_CFLAGS])
 
-# Checks for libraries.
-PKG_CHECK_MODULES(
-	[OPENSSL],
-	[libcrypto >= 3.0.5, libssl],
-	,
-	[AC_MSG_ERROR([libcrypto >= 3.0.5 is required])]
-)
+AC_ARG_WITH([openssl],
+  [AS_HELP_STRING([--with-openssl],[the path to the OpenSSL files])],
+  [
+      OPENSSL_DIR=${withval}
+      case "$OPENSSL_DIR" in
+        # Relative paths
+        ./*|../*)  OPENSSL_DIR="`pwd`/$OPENSSL_DIR"
+      esac
+      if test -d "$OPENSSL_DIR/lib"; then
+        libcrypto_path="$OPENSSL_DIR/lib"
+      elif test -d "$OPENSSL_DIR/lib64"; then
+        libcrypto_path="$OPENSSL_DIR/lib64"
+      else
+        # Built but not installed
+        libcrypto_path="$OPENSSL_DIR"
+      fi
+      CFLAGS="-I$OPENSSL_DIR/include $CFLAGS"
+      LDFLAGS="-L${libcrypto_path} ${LDFLAGS}"
+      LIBS="$LIBS -L${libcrypto_path}"
+      AC_MSG_WARN([Custom openssl located in $OPENSSL_DIR is used, lib version check is skipped])
+  ],
+  [
+      # Checks for libraries.
+      PKG_CHECK_MODULES(
+        [OPENSSL],
+        [libcrypto >= 3.0.5, libssl],
+        ,
+        [AC_MSG_ERROR([libcrypto >= 3.0.5 is required])]
+      )
+  ])
+
 AC_SUBST([SHARED_EXT], $(eval echo "${shrext_cmds}"))
 
 # Check whether we have a p11-kit to use as a default PKCS#11 module
@@ -92,6 +116,7 @@ AC_CHECK_HEADERS([string.h dlfcn.h])
 
 # Checks for typedefs, structures, and compiler characteristics.
 AC_CHECK_HEADER_STDBOOL
+AC_C_BIGENDIAN
 AC_C_INLINE
 AC_TYPE_SIZE_T
 

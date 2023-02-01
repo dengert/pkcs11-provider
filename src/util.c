@@ -5,34 +5,37 @@
 #include <string.h>
 #include <time.h>
 #include "platform/endian.h"
+#include <openssl/bn.h>
+#include <openssl/x509.h>
+
+#define FA_RETURN_VAL(x, _a, _b) \
+    do { \
+        *x.value_ptr = _a; \
+        *x.value_len_ptr = _b; \
+    } while (0)
+
+#define FA_RETURN_LEN(x, _a) *x.value_len_ptr = _a
 
 CK_RV p11prov_fetch_attributes(P11PROV_CTX *ctx, P11PROV_SESSION *session,
                                CK_OBJECT_HANDLE object,
                                struct fetch_attrs *attrs,
                                unsigned long attrnums)
 {
-    CK_FUNCTION_LIST *f;
     CK_SESSION_HANDLE sess = p11prov_session_handle(session);
     CK_ATTRIBUTE q[attrnums];
     CK_ATTRIBUTE r[attrnums];
     CK_RV ret;
 
-    ret = p11prov_ctx_status(ctx, &f);
-    if (ret != CKR_OK) {
-        return ret;
-    }
-
     for (size_t i = 0; i < attrnums; i++) {
         if (attrs[i].allocate) {
-            CKATTR_ASSIGN_ALL(q[i], attrs[i].type, NULL, 0);
+            CKATTR_ASSIGN(q[i], attrs[i].type, NULL, 0);
         } else {
-            CKATTR_ASSIGN_ALL(q[i], attrs[i].type, *attrs[i].value,
-                              *attrs[i].value_len);
+            CKATTR_SET(q[i], attrs[i]);
         }
     }
 
     /* try one shot, then fallback to individual calls if that fails */
-    ret = f->C_GetAttributeValue(sess, object, q, attrnums);
+    ret = p11prov_GetAttributeValue(ctx, sess, object, q, attrnums);
     if (ret == CKR_OK) {
         unsigned long retrnums = 0;
         for (size_t i = 0; i < attrnums; i++) {
@@ -52,15 +55,14 @@ CK_RV p11prov_fetch_attributes(P11PROV_CTX *ctx, P11PROV_SESSION *session,
                 }
                 FA_RETURN_VAL(attrs[i], a, q[i].ulValueLen);
 
-                CKATTR_ASSIGN_ALL(r[retrnums], attrs[i].type, *attrs[i].value,
-                                  *attrs[i].value_len);
+                CKATTR_SET(r[retrnums], attrs[i]);
                 retrnums++;
             } else {
                 FA_RETURN_LEN(attrs[i], q[i].ulValueLen);
             }
         }
         if (retrnums > 0) {
-            ret = f->C_GetAttributeValue(sess, object, r, retrnums);
+            ret = p11prov_GetAttributeValue(ctx, sess, object, r, retrnums);
         }
     } else if (attrnums > 1
                && (ret == CKR_ATTRIBUTE_SENSITIVE
@@ -70,8 +72,8 @@ CK_RV p11prov_fetch_attributes(P11PROV_CTX *ctx, P11PROV_SESSION *session,
          * and does not handle it gracefully */
         for (size_t i = 0; i < attrnums; i++) {
             if (attrs[i].allocate) {
-                CKATTR_ASSIGN_ALL(q[0], attrs[i].type, NULL, 0);
-                ret = f->C_GetAttributeValue(sess, object, q, 1);
+                CKATTR_ASSIGN(q[0], attrs[i].type, NULL, 0);
+                ret = p11prov_GetAttributeValue(ctx, sess, object, q, 1);
                 if (ret != CKR_OK) {
                     if (attrs[i].required) {
                         return ret;
@@ -84,9 +86,8 @@ CK_RV p11prov_fetch_attributes(P11PROV_CTX *ctx, P11PROV_SESSION *session,
                     FA_RETURN_VAL(attrs[i], a, q[0].ulValueLen);
                 }
             }
-            CKATTR_ASSIGN_ALL(r[0], attrs[i].type, *attrs[i].value,
-                              *attrs[i].value_len);
-            ret = f->C_GetAttributeValue(sess, object, r, 1);
+            CKATTR_SET(r[0], attrs[i]);
+            ret = p11prov_GetAttributeValue(ctx, sess, object, r, 1);
             if (ret != CKR_OK) {
                 if (r[0].ulValueLen == CK_UNAVAILABLE_INFORMATION) {
                     FA_RETURN_LEN(attrs[i], 0);
@@ -95,12 +96,43 @@ CK_RV p11prov_fetch_attributes(P11PROV_CTX *ctx, P11PROV_SESSION *session,
                     return ret;
                 }
             }
-            P11PROV_debug("Attribute| type:%lu value:%p, len:%lu",
-                          attrs[i].type, *attrs[i].value, *attrs[i].value_len);
+            P11PROV_debug("Attribute| type:0x%08lX value:%p, len:%lu",
+                          attrs[i].type, *attrs[i].value_ptr,
+                          *attrs[i].value_len_ptr);
         }
         ret = CKR_OK;
     }
     return ret;
+}
+
+void p11prov_move_alloc_attrs(struct fetch_attrs *attrs, int num,
+                              CK_ATTRIBUTE *ck_attrs, int *ck_num)
+{
+    int c = *ck_num;
+    for (int i = 0; i < num; i++) {
+        if (!attrs[i].allocate) {
+            continue;
+        }
+        if (*attrs[i].value_len_ptr > 0) {
+            ck_attrs[c].type = attrs[i].type;
+            ck_attrs[c].pValue = *attrs[i].value_ptr;
+            ck_attrs[c].ulValueLen = *attrs[i].value_len_ptr;
+            c++;
+            /* clear moved values */
+            *attrs[i].value_ptr = NULL;
+            *attrs[i].value_len_ptr = 0;
+        }
+    }
+    *ck_num = c;
+}
+
+void p11prov_fetch_attrs_free(struct fetch_attrs *attrs, int num)
+{
+    for (int i = 0; i < num; i++) {
+        if (attrs[i].allocate) {
+            OPENSSL_free(*attrs[i].value_ptr);
+        }
+    }
 }
 
 struct p11prov_uri {
@@ -108,7 +140,6 @@ struct p11prov_uri {
     char *manufacturer;
     char *token;
     char *serial;
-    char *object;
     CK_ATTRIBUTE id;
     CK_ATTRIBUTE label;
     char *pin;
@@ -246,7 +277,7 @@ done:
     return ret;
 }
 
-P11PROV_URI *p11prov_parse_uri(const char *uri)
+P11PROV_URI *p11prov_parse_uri(P11PROV_CTX *ctx, const char *uri)
 {
     struct p11prov_uri *u;
     const char *p, *end;
@@ -334,10 +365,11 @@ P11PROV_URI *p11prov_parse_uri(const char *uri)
                 u->class = CKO_PUBLIC_KEY;
             } else if (len == 7 && strncmp(p, "private", 7) == 0) {
                 u->class = CKO_PRIVATE_KEY;
-            } else if (len == 7 && strncmp(p, "secret", 7) == 0) {
+            } else if (len == 6 && strncmp(p, "secret", 6) == 0) {
                 u->class = CKO_SECRET_KEY;
             } else {
-                P11PROV_debug("Unknown object type");
+                P11PROV_raise(ctx, CKR_ARGUMENTS_BAD,
+                              "Unknown object type [%.*s]", (int)len, p);
                 ret = EINVAL;
                 goto done;
             }
@@ -548,4 +580,84 @@ CK_RV p11prov_token_sup_attr(P11PROV_CTX *ctx, CK_SLOT_ID id, int action,
     default:
         return CKR_ARGUMENTS_BAD;
     }
+}
+
+CK_RV p11prov_copy_attr(CK_ATTRIBUTE *dst, CK_ATTRIBUTE *src)
+{
+    if (src->ulValueLen) {
+        dst->pValue = OPENSSL_malloc(src->ulValueLen);
+        if (!dst->pValue) {
+            return CKR_HOST_MEMORY;
+        }
+        memcpy(dst->pValue, src->pValue, src->ulValueLen);
+        dst->ulValueLen = src->ulValueLen;
+    }
+    dst->type = src->type;
+
+    return CKR_OK;
+}
+
+bool p11prov_x509_names_are_equal(CK_ATTRIBUTE *a, CK_ATTRIBUTE *b)
+{
+    const unsigned char *val;
+    X509_NAME *xa;
+    X509_NAME *xb;
+    int cmp;
+
+    /* d2i function modify the val pointer */
+    val = a->pValue;
+    xa = d2i_X509_NAME(NULL, &val, a->ulValueLen);
+    if (!xa) {
+        return false;
+    }
+    val = b->pValue;
+    xb = d2i_X509_NAME(NULL, &val, b->ulValueLen);
+    if (!xb) {
+        X509_NAME_free(xa);
+        return false;
+    }
+
+    cmp = X509_NAME_cmp(xa, xb);
+
+    X509_NAME_free(xa);
+    X509_NAME_free(xb);
+    return cmp == 0;
+}
+
+char *p11prov_alloc_sprintf(int size_hint, const char *format, ...)
+{
+    char *buf = NULL;
+    va_list args;
+    int repeat = 1;
+    int ret;
+
+again:
+    if (repeat-- < 0) {
+        ret = -1;
+        goto done;
+    }
+
+    if (size_hint) {
+        buf = OPENSSL_malloc(size_hint);
+    }
+
+    va_start(args, format);
+    ret = vsnprintf(buf, size_hint, format, args);
+    va_end(args);
+
+    if (ret >= size_hint) {
+        size_hint = ret + 1;
+        OPENSSL_free(buf);
+        buf = NULL;
+        goto again;
+    }
+
+done:
+    if (ret < 0) {
+        OPENSSL_free(buf);
+        buf = NULL;
+    } else if (size_hint > ret + 1) {
+        buf = OPENSSL_realloc(buf, ret + 1);
+    }
+    return buf;
 }

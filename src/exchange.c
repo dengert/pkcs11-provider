@@ -161,7 +161,7 @@ static int p11prov_ecdh_init(void *ctx, void *provkey,
         return RET_OSSL_ERR;
     }
 
-    ret = p11prov_ctx_status(ecdhctx->provctx, NULL);
+    ret = p11prov_ctx_status(ecdhctx->provctx);
     if (ret != CKR_OK) {
         return RET_OSSL_ERR;
     }
@@ -227,6 +227,7 @@ static int p11prov_ecdh_derive(void *ctx, unsigned char *secret,
     CK_SLOT_ID slotid;
     unsigned long secret_len;
     struct fetch_attrs attrs[1];
+    int num = 0;
     CK_RV ret;
 
     if (ecdhctx->key == NULL || ecdhctx->peer_key == NULL) {
@@ -291,10 +292,10 @@ static int p11prov_ecdh_derive(void *ctx, unsigned char *secret,
     }
 
     P11PROV_debug("ECDH derived hey handle: %lu", secret_handle);
-    FA_ASSIGN_ALL(attrs[0], CKA_VALUE, &secret, &secret_len, false, true);
+    FA_SET_BUF_VAL(attrs, num, CKA_VALUE, secret, secret_len, false, true);
     ret = p11prov_fetch_attributes(ecdhctx->provctx, session, secret_handle,
-                                   attrs, 1);
-    p11prov_session_free(session);
+                                   attrs, num);
+    p11prov_return_session(session);
     if (ret != CKR_OK) {
         P11PROV_debug("ecdh failed to retrieve secret %lu", ret);
         return RET_OSSL_ERR;
@@ -591,7 +592,7 @@ static int p11prov_exch_hkdf_init(void *ctx, void *provkey,
         return RET_OSSL_ERR;
     }
 
-    ret = p11prov_ctx_status(hkdfctx->provctx, NULL);
+    ret = p11prov_ctx_status(hkdfctx->provctx);
     if (ret != CKR_OK) {
         return RET_OSSL_ERR;
     }

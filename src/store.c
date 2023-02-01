@@ -37,9 +37,7 @@ static void p11prov_store_ctx_free(struct p11prov_store_ctx *ctx)
         return;
     }
 
-    if (ctx->session != NULL) {
-        p11prov_session_free(ctx->session);
-    }
+    p11prov_return_session(ctx->session);
 
     p11prov_uri_free(ctx->parsed_uri);
     OPENSSL_free(ctx->subject.pValue);
@@ -49,6 +47,7 @@ static void p11prov_store_ctx_free(struct p11prov_store_ctx *ctx)
     OPENSSL_free(ctx->alias);
     OPENSSL_free(ctx->properties);
     OPENSSL_free(ctx->input_type);
+    BN_free(ctx->serial);
 
     for (int i = 0; i < ctx->num_objs; i++) {
         p11prov_obj_free(ctx->objects[i]);
@@ -94,14 +93,14 @@ static void store_fetch(struct p11prov_store_ctx *ctx,
         nextid = CK_UNAVAILABLE_INFORMATION;
 
         if (ctx->session != NULL) {
-            p11prov_session_free(ctx->session);
-            ctx->session = CK_INVALID_HANDLE;
+            p11prov_return_session(ctx->session);
+            ctx->session = NULL;
         }
 
-        ret =
-            p11prov_get_session(ctx->provctx, &slotid, &nextid, ctx->parsed_uri,
-                                pw_cb, pw_cbarg, false, false, &ctx->session);
-        if (ret != CKR_OK || ctx->session == CK_INVALID_HANDLE) {
+        ret = p11prov_get_session(ctx->provctx, &slotid, &nextid,
+                                  ctx->parsed_uri, CK_UNAVAILABLE_INFORMATION,
+                                  pw_cb, pw_cbarg, false, false, &ctx->session);
+        if (ret != CKR_OK) {
             P11PROV_raise(ctx->provctx, ret,
                           "Failed to get session to load keys");
 
@@ -149,12 +148,10 @@ static void *p11prov_store_open(void *pctx, const char *uri)
     }
     ctx->provctx = (P11PROV_CTX *)pctx;
 
-    ctx->parsed_uri = p11prov_parse_uri(uri);
+    ctx->parsed_uri = p11prov_parse_uri(ctx->provctx, uri);
     if (ctx->parsed_uri == NULL) {
         goto done;
     }
-
-    store_fetch(ctx, NULL, NULL);
 
     result = CKR_OK;
 
@@ -180,8 +177,9 @@ static int p11prov_store_load(void *pctx, OSSL_CALLBACK *object_cb,
                               OSSL_PASSPHRASE_CALLBACK *pw_cb, void *pw_cbarg)
 {
     struct p11prov_store_ctx *ctx = (struct p11prov_store_ctx *)pctx;
-    void *reference;
+    void *reference = NULL;
     size_t reference_sz;
+    CK_ATTRIBUTE *cert = NULL;
     P11PROV_OBJ *obj = NULL;
     OSSL_PARAM params[4];
     int object_type;
@@ -199,16 +197,76 @@ static int p11prov_store_load(void *pctx, OSSL_CALLBACK *object_cb,
         return RET_OSSL_ERR;
     }
 
-    while (!found && ctx->fetched < ctx->num_objs) {
+    while (ctx->fetched < ctx->num_objs) {
         obj = ctx->objects[ctx->fetched];
         ctx->fetched++;
 
         /* Supported search types in OSSL_STORE_SEARCH(3) */
         switch (p11prov_obj_get_class(obj)) {
         case CKO_CERTIFICATE:
-            /* ctx->subject */
-            /* ctx->issuer */
-            /* ctx->serial */
+            if (ctx->subject.type == CKA_SUBJECT) {
+                CK_ATTRIBUTE *subject;
+                /* unfortunately different but equivalent encodings may be
+                 * used for the same attributes by different certificate
+                 * generation tools, so a simple memcmp is not possible
+                 * for the DER encoding of a DN, for example NSs tools use
+                 * PRINTABLESTRING for CN while moder openssl use UTF8STRING
+                 * ANS1 tags for the encoding of the same attribute */
+
+                subject = p11prov_obj_get_attr(obj, CKA_SUBJECT);
+                if (!subject) {
+                    /* no match, try next */
+                    continue;
+                }
+                /* TODO: X509_NAME caching for ctx->subject ? */
+                if (!p11prov_x509_names_are_equal(&ctx->subject, subject)) {
+                    /* no match, try next */
+                    continue;
+                }
+            }
+            if (ctx->issuer.type == CKA_ISSUER) {
+                CK_ATTRIBUTE *issuer;
+
+                issuer = p11prov_obj_get_attr(obj, CKA_ISSUER);
+                if (!issuer) {
+                    /* no match, try next */
+                    continue;
+                }
+                /* TODO: X509_NAME caching for ctx->issuer ? */
+                if (!p11prov_x509_names_are_equal(&ctx->issuer, issuer)) {
+                    /* no match, try next */
+                    continue;
+                }
+            }
+            if (ctx->serial) {
+                const unsigned char *val;
+                CK_ATTRIBUTE *serial;
+                ASN1_INTEGER *asn1_serial;
+                BIGNUM *bn_serial;
+                int cmp;
+
+                serial = p11prov_obj_get_attr(obj, CKA_SERIAL_NUMBER);
+                if (!serial) {
+                    continue;
+                }
+                val = serial->pValue;
+                asn1_serial = d2i_ASN1_INTEGER(NULL, &val, serial->ulValueLen);
+                if (!asn1_serial) {
+                    continue;
+                }
+                bn_serial = ASN1_INTEGER_to_BN(asn1_serial, NULL);
+                if (!bn_serial) {
+                    ASN1_INTEGER_free(asn1_serial);
+                    continue;
+                }
+                cmp = BN_ucmp(ctx->serial, bn_serial);
+                ASN1_INTEGER_free(asn1_serial);
+                BN_free(bn_serial);
+                if (cmp != 0) {
+                    /* no match, try next */
+                    continue;
+                }
+            }
             break;
         case CKO_PUBLIC_KEY:
         case CKO_PRIVATE_KEY:
@@ -217,14 +275,17 @@ static int p11prov_store_load(void *pctx, OSSL_CALLBACK *object_cb,
             if (ctx->alias) {
                 CK_ATTRIBUTE *label;
                 label = p11prov_obj_get_attr(obj, CKA_LABEL);
-                if (label && strcmp(ctx->alias, label->pValue) == 0) {
-                    found = true;
+                if (!label || strcmp(ctx->alias, label->pValue) != 0) {
+                    /* no match, try next */
+                    continue;
                 }
-            } else {
-                found = true;
             }
             break;
         }
+
+        /* if we get here it means the object matched */
+        found = true;
+        break;
     }
 
     if (!found) {
@@ -246,6 +307,15 @@ static int p11prov_store_load(void *pctx, OSSL_CALLBACK *object_cb,
         default:
             return RET_OSSL_ERR;
         }
+        p11prov_obj_to_reference(obj, &reference, &reference_sz);
+        break;
+    case CKO_CERTIFICATE:
+        object_type = OSSL_OBJECT_CERT;
+        data_type = (char *)"CERTIFICATE";
+        cert = p11prov_obj_get_attr(obj, CKA_VALUE);
+        if (cert == NULL) {
+            return RET_OSSL_ERR;
+        }
         break;
     default:
         return RET_OSSL_ERR;
@@ -254,11 +324,16 @@ static int p11prov_store_load(void *pctx, OSSL_CALLBACK *object_cb,
     params[0] = OSSL_PARAM_construct_int(OSSL_OBJECT_PARAM_TYPE, &object_type);
     params[1] = OSSL_PARAM_construct_utf8_string(OSSL_OBJECT_PARAM_DATA_TYPE,
                                                  data_type, 0);
-
-    /* giving away the object by reference */
-    p11prov_obj_to_reference(obj, &reference, &reference_sz);
-    params[2] = OSSL_PARAM_construct_octet_string(OSSL_OBJECT_PARAM_REFERENCE,
-                                                  reference, reference_sz);
+    if (reference) {
+        /* giving away the object by reference */
+        params[2] = OSSL_PARAM_construct_octet_string(
+            OSSL_OBJECT_PARAM_REFERENCE, reference, reference_sz);
+    } else if (cert) {
+        params[2] = OSSL_PARAM_construct_octet_string(
+            OSSL_OBJECT_PARAM_DATA, cert->pValue, cert->ulValueLen);
+    } else {
+        return RET_OSSL_ERR;
+    }
     params[3] = OSSL_PARAM_construct_end();
 
     return object_cb(params, object_cbarg);
@@ -297,23 +372,10 @@ static int p11prov_store_export_object(void *loaderctx, const void *reference,
                                        size_t reference_sz,
                                        OSSL_CALLBACK *cb_fn, void *cb_arg)
 {
-    P11PROV_OBJ *obj = NULL;
-
     P11PROV_debug("store (%p) export object %p, %zu", loaderctx, reference,
                   reference_sz);
 
-    /* the contents of the reference is the address to our object */
-    obj = p11prov_obj_from_reference(reference, reference_sz);
-    if (!obj) {
-        return RET_OSSL_ERR;
-    }
-
-    /* we can only export public bits, so that's all we do */
-    if (p11prov_obj_get_class(obj) != CKO_PUBLIC_KEY) {
-        return RET_OSSL_ERR;
-    }
-
-    return p11prov_obj_export_public_rsa_key(obj, cb_fn, cb_arg);
+    return RET_OSSL_ERR;
 }
 
 static const OSSL_PARAM *p11prov_store_settable_ctx_params(void *provctx)
@@ -420,6 +482,15 @@ static int p11prov_store_set_ctx_params(void *pctx, const OSSL_PARAM params[])
         OPENSSL_free(ctx->input_type);
         ctx->input_type = NULL;
         ret = OSSL_PARAM_get_utf8_string(p, &ctx->input_type, 0);
+        if (ret != RET_OSSL_OK) {
+            return ret;
+        }
+    }
+    p = OSSL_PARAM_locate_const(params, OSSL_STORE_PARAM_SERIAL);
+    if (p) {
+        BN_free(ctx->serial);
+        ctx->serial = NULL;
+        ret = OSSL_PARAM_get_BN(p, &ctx->serial);
         if (ret != RET_OSSL_OK) {
             return ret;
         }

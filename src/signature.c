@@ -49,7 +49,6 @@ static P11PROV_SIG_CTX *p11prov_sig_newctx(P11PROV_CTX *ctx,
     }
 
     sigctx->mechtype = type;
-    sigctx->session = CK_INVALID_HANDLE;
 
     return sigctx;
 }
@@ -58,7 +57,6 @@ static void *p11prov_sig_dupctx(void *ctx)
 {
     P11PROV_SIG_CTX *sigctx = (P11PROV_SIG_CTX *)ctx;
     P11PROV_SIG_CTX *newctx;
-    CK_FUNCTION_LIST *f;
     CK_SLOT_ID slotid = CK_UNAVAILABLE_INFORMATION;
     CK_OBJECT_HANDLE handle = CK_INVALID_HANDLE;
     CK_BYTE_PTR state = NULL;
@@ -70,8 +68,15 @@ static void *p11prov_sig_dupctx(void *ctx)
         return NULL;
     }
 
-    ret = p11prov_ctx_status(sigctx->provctx, &f);
-    if (ret != CKR_OK) {
+    switch (sigctx->operation) {
+    case CKF_SIGN:
+        reqlogin = true;
+        /* fallthrough */
+    case CKF_VERIFY:
+        slotid = p11prov_obj_get_slotid(sigctx->key);
+        handle = p11prov_obj_get_handle(sigctx->key);
+        break;
+    default:
         return NULL;
     }
 
@@ -85,41 +90,29 @@ static void *p11prov_sig_dupctx(void *ctx)
     newctx->mechtype = sigctx->mechtype;
     newctx->digest = sigctx->digest;
     newctx->pss_params = sigctx->pss_params;
+    newctx->operation = sigctx->operation;
 
     if (sigctx->session == NULL) {
         goto done;
     }
 
-    /* This is not really funny. OpenSSL by dfault assume contexts with
+    /* This is not really funny. OpenSSL by default assumes contexts with
      * operations in flight can be easily duplicated, with all the
-     * cryptographic status and then both context can keep going
+     * cryptographic status and then both contexts can keep going
      * independently. We'll try here, but on failure we just 'move' the
-     * to the new token and hope for the best */
+     * session to the new context (because that's what OpenSSL seem to
+     * prefer to use after duplication) and hope for the best. */
 
     newctx->session = sigctx->session;
     sigctx->session = NULL;
-
-    switch (sigctx->operation) {
-    case CKF_SIGN:
-        reqlogin = true;
-        /* fallthrough */
-    case CKF_VERIFY:
-        slotid = p11prov_obj_get_slotid(sigctx->key);
-        handle = p11prov_obj_get_handle(newctx->key);
-        break;
-    default:
-        p11prov_sig_freectx(newctx);
-        return NULL;
-    }
 
     if (slotid != CK_UNAVAILABLE_INFORMATION && handle != CK_INVALID_HANDLE) {
         CK_SESSION_HANDLE newsess = p11prov_session_handle(newctx->session);
         CK_SESSION_HANDLE sess = CK_INVALID_HANDLE;
 
-        ret = f->C_GetOperationState(newsess, NULL_PTR, &state_len);
+        ret = p11prov_GetOperationState(sigctx->provctx, newsess, NULL_PTR,
+                                        &state_len);
         if (ret != CKR_OK) {
-            P11PROV_raise(sigctx->provctx, ret,
-                          "Error returned by C_GetOperationState");
             goto done;
         }
         state = OPENSSL_malloc(state_len);
@@ -127,15 +120,15 @@ static void *p11prov_sig_dupctx(void *ctx)
             goto done;
         }
 
-        ret = f->C_GetOperationState(newsess, state, &state_len);
+        ret = p11prov_GetOperationState(sigctx->provctx, newsess, state,
+                                        &state_len);
         if (ret != CKR_OK) {
-            P11PROV_raise(sigctx->provctx, ret,
-                          "Error returned by C_GetOperationState");
             goto done;
         }
 
-        ret = p11prov_get_session(sigctx->provctx, &slotid, NULL, NULL, NULL,
-                                  NULL, reqlogin, false, &sigctx->session);
+        ret = p11prov_get_session(sigctx->provctx, &slotid, NULL, NULL,
+                                  sigctx->mechtype, NULL, NULL, reqlogin, false,
+                                  &sigctx->session);
         if (ret != CKR_OK) {
             P11PROV_raise(sigctx->provctx, ret,
                           "Failed to open session on slot %lu", slotid);
@@ -143,19 +136,16 @@ static void *p11prov_sig_dupctx(void *ctx)
         }
         sess = p11prov_session_handle(sigctx->session);
 
-        ret = f->C_SetOperationState(sess, state, state_len, CK_INVALID_HANDLE,
-                                     handle);
+        ret = p11prov_SetOperationState(sigctx->provctx, sess, state, state_len,
+                                        handle, handle);
         if (ret != CKR_OK) {
-            P11PROV_raise(sigctx->provctx, ret,
-                          "Error returned by C_SetOperationState");
-            p11prov_session_free(sigctx->session);
+            p11prov_return_session(sigctx->session);
             sigctx->session = NULL;
         }
     }
 
 done:
     OPENSSL_free(state);
-    newctx->operation = sigctx->operation;
     return newctx;
 }
 
@@ -167,7 +157,7 @@ static void p11prov_sig_freectx(void *ctx)
         return;
     }
 
-    p11prov_session_free(sigctx->session);
+    p11prov_return_session(sigctx->session);
     p11prov_obj_free(sigctx->key);
     OPENSSL_free(sigctx->properties);
     OPENSSL_clear_free(sigctx, sizeof(P11PROV_SIG_CTX));
@@ -531,7 +521,7 @@ static int p11prov_sig_op_init(void *ctx, void *provkey, CK_FLAGS operation,
     CK_OBJECT_CLASS class;
     CK_RV ret;
 
-    ret = p11prov_ctx_status(sigctx->provctx, NULL);
+    ret = p11prov_ctx_status(sigctx->provctx);
     if (ret != CKR_OK) {
         return RET_OSSL_ERR;
     }
@@ -573,7 +563,6 @@ static int p11prov_sig_op_init(void *ctx, void *provkey, CK_FLAGS operation,
 static int p11prov_sig_operate_init(P11PROV_SIG_CTX *sigctx, bool digest_op,
                                     P11PROV_SESSION **_session)
 {
-    CK_FUNCTION_LIST *f;
     CK_MECHANISM mechanism;
     P11PROV_SESSION *session;
     CK_SESSION_HANDLE sess;
@@ -582,7 +571,7 @@ static int p11prov_sig_operate_init(P11PROV_SIG_CTX *sigctx, bool digest_op,
     bool reqlogin = false;
     CK_RV ret;
 
-    ret = p11prov_ctx_status(sigctx->provctx, &f);
+    ret = p11prov_ctx_status(sigctx->provctx);
     if (ret != CKR_OK) {
         return ret;
     }
@@ -609,8 +598,9 @@ static int p11prov_sig_operate_init(P11PROV_SIG_CTX *sigctx, bool digest_op,
         reqlogin = true;
     }
 
-    ret = p11prov_get_session(sigctx->provctx, &slotid, NULL, NULL, NULL, NULL,
-                              reqlogin, false, &session);
+    ret = p11prov_get_session(sigctx->provctx, &slotid, NULL, NULL,
+                              mechanism.mechanism, NULL, NULL, reqlogin, false,
+                              &session);
     if (ret != CKR_OK) {
         P11PROV_raise(sigctx->provctx, ret,
                       "Failed to open session on slot %lu", slotid);
@@ -619,16 +609,9 @@ static int p11prov_sig_operate_init(P11PROV_SIG_CTX *sigctx, bool digest_op,
     sess = p11prov_session_handle(session);
 
     if (sigctx->operation == CKF_SIGN) {
-        ret = f->C_SignInit(sess, &mechanism, handle);
-        if (ret != CKR_OK) {
-            P11PROV_raise(sigctx->provctx, ret, "Error returned by C_SignInit");
-        }
+        ret = p11prov_SignInit(sigctx->provctx, sess, &mechanism, handle);
     } else {
-        ret = f->C_VerifyInit(sess, &mechanism, handle);
-        if (ret != CKR_OK) {
-            P11PROV_raise(sigctx->provctx, ret,
-                          "Error returned by C_VerifyInit");
-        }
+        ret = p11prov_VerifyInit(sigctx->provctx, sess, &mechanism, handle);
     }
     if (ret != CKR_OK) {
         int result = ret;
@@ -636,7 +619,7 @@ static int p11prov_sig_operate_init(P11PROV_SIG_CTX *sigctx, bool digest_op,
             || ret == CKR_MECHANISM_PARAM_INVALID) {
             ERR_raise(ERR_LIB_PROV, PROV_R_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE);
         }
-        p11prov_session_free(session);
+        p11prov_return_session(session);
         return result;
     }
 
@@ -648,7 +631,6 @@ static int p11prov_sig_operate(P11PROV_SIG_CTX *sigctx, unsigned char *sig,
                                size_t *siglen, size_t sigsize,
                                unsigned char *tbs, size_t tbslen)
 {
-    CK_FUNCTION_LIST *f;
     P11PROV_SESSION *session;
     CK_SESSION_HANDLE sess;
     CK_ULONG sig_size = sigsize;
@@ -706,21 +688,10 @@ static int p11prov_sig_operate(P11PROV_SIG_CTX *sigctx, unsigned char *sig,
     }
     sess = p11prov_session_handle(session);
 
-    ret = p11prov_ctx_status(sigctx->provctx, &f);
-    if (ret != CKR_OK) {
-        return RET_OSSL_ERR;
-    }
-
     if (sigctx->operation == CKF_SIGN) {
-        ret = f->C_Sign(sess, tbs, tbslen, sig, &sig_size);
-        if (ret != CKR_OK) {
-            P11PROV_raise(sigctx->provctx, ret, "Error returned by C_Sign");
-        }
+        ret = p11prov_Sign(sigctx->provctx, sess, tbs, tbslen, sig, &sig_size);
     } else {
-        ret = f->C_Verify(sess, tbs, tbslen, sig, sigsize);
-        if (ret != CKR_OK) {
-            P11PROV_raise(sigctx->provctx, ret, "Error returned by C_Verify");
-        }
+        ret = p11prov_Verify(sigctx->provctx, sess, tbs, tbslen, sig, sigsize);
     }
     if (ret != CKR_OK) {
         goto endsess;
@@ -732,7 +703,7 @@ static int p11prov_sig_operate(P11PROV_SIG_CTX *sigctx, unsigned char *sig,
     result = RET_OSSL_OK;
 
 endsess:
-    p11prov_session_free(session);
+    p11prov_return_session(session);
     if (tbs == data) {
         OPENSSL_cleanse(data, sizeof(data));
     }
@@ -743,13 +714,7 @@ static int p11prov_sig_digest_update(P11PROV_SIG_CTX *sigctx,
                                      unsigned char *data, size_t datalen)
 {
     CK_SESSION_HANDLE sess;
-    CK_FUNCTION_LIST *f;
     CK_RV ret;
-
-    ret = p11prov_ctx_status(sigctx->provctx, &f);
-    if (ret != CKR_OK) {
-        return RET_OSSL_ERR;
-    }
 
     if (sigctx->session == CK_INVALID_HANDLE) {
         ret = p11prov_sig_operate_init(sigctx, true, &sigctx->session);
@@ -761,20 +726,12 @@ static int p11prov_sig_digest_update(P11PROV_SIG_CTX *sigctx,
 
     /* we have an initialized session */
     if (sigctx->operation == CKF_SIGN) {
-        ret = f->C_SignUpdate(sess, data, datalen);
-        if (ret != CKR_OK) {
-            P11PROV_raise(sigctx->provctx, ret,
-                          "Error returned by C_SignUpdate");
-        }
+        ret = p11prov_SignUpdate(sigctx->provctx, sess, data, datalen);
     } else {
-        ret = f->C_VerifyUpdate(sess, data, datalen);
-        if (ret != CKR_OK) {
-            P11PROV_raise(sigctx->provctx, ret,
-                          "Error returned by C_VerifyUpdate");
-        }
+        ret = p11prov_VerifyUpdate(sigctx->provctx, sess, data, datalen);
     }
     if (ret != CKR_OK) {
-        p11prov_session_free(sigctx->session);
+        p11prov_return_session(sigctx->session);
         sigctx->session = NULL;
         return RET_OSSL_ERR;
     }
@@ -787,7 +744,6 @@ static int p11prov_sig_digest_final(P11PROV_SIG_CTX *sigctx, unsigned char *sig,
 {
     CK_SESSION_HANDLE sess;
     CK_ULONG sig_size = sigsize;
-    CK_FUNCTION_LIST *f;
     int result = RET_OSSL_ERR;
     CK_RV ret;
 
@@ -803,23 +759,10 @@ static int p11prov_sig_digest_final(P11PROV_SIG_CTX *sigctx, unsigned char *sig,
     }
     sess = p11prov_session_handle(sigctx->session);
 
-    ret = p11prov_ctx_status(sigctx->provctx, &f);
-    if (ret != CKR_OK) {
-        return RET_OSSL_ERR;
-    }
-
     if (sigctx->operation == CKF_SIGN) {
-        ret = f->C_SignFinal(sess, sig, &sig_size);
-        if (ret != CKR_OK) {
-            P11PROV_raise(sigctx->provctx, ret,
-                          "Error returned by C_SignFinal");
-        }
+        ret = p11prov_SignFinal(sigctx->provctx, sess, sig, &sig_size);
     } else {
-        ret = f->C_VerifyFinal(sess, sig, sigsize);
-        if (ret != CKR_OK) {
-            P11PROV_raise(sigctx->provctx, ret,
-                          "Error returned by C_VerifyFinal");
-        }
+        ret = p11prov_VerifyFinal(sigctx->provctx, sess, sig, sigsize);
     }
 
     if (ret == CKR_OK) {
@@ -829,7 +772,7 @@ static int p11prov_sig_digest_final(P11PROV_SIG_CTX *sigctx, unsigned char *sig,
         result = RET_OSSL_OK;
     }
 
-    p11prov_session_free(sigctx->session);
+    p11prov_return_session(sigctx->session);
     sigctx->session = NULL;
     return result;
 }
