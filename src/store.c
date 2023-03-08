@@ -177,6 +177,7 @@ static void *p11prov_store_open(void *pctx, const char *uri)
 
     ctx->parsed_uri = p11prov_parse_uri(ctx->provctx, uri);
     if (ctx->parsed_uri == NULL) {
+        ret = CKR_HOST_MEMORY;
         goto done;
     }
 
@@ -326,10 +327,22 @@ static int p11prov_store_load(void *pctx, OSSL_CALLBACK *object_cb,
         type = p11prov_obj_get_key_type(obj);
         switch (type) {
         case CKK_RSA:
-            data_type = (char *)P11PROV_NAMES_RSA;
+            data_type = (char *)P11PROV_NAME_RSA;
             break;
         case CKK_EC:
-            data_type = (char *)P11PROV_NAMES_EC;
+            data_type = (char *)P11PROV_NAME_EC;
+            break;
+        case CKK_EC_EDWARDS:
+            switch (p11prov_obj_get_key_bit_size(obj)) {
+            case ED448_BIT_SIZE:
+                data_type = (char *)ED448;
+                break;
+            case ED25519_BIT_SIZE:
+                data_type = (char *)ED25519;
+                break;
+            default:
+                return RET_OSSL_ERR;
+            }
             break;
         default:
             return RET_OSSL_ERR;
