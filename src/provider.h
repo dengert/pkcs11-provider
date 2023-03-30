@@ -30,12 +30,6 @@
 #define RET_OSSL_ERR 0
 #define RET_OSSL_BAD -1
 
-#define P11PROV_PKCS11_MODULE_PATH "pkcs11-module-path"
-#define P11PROV_PKCS11_MODULE_INIT_ARGS "pkcs11-module-init-args"
-#define P11PROV_PKCS11_MODULE_TOKEN_PIN "pkcs11-module-token-pin"
-#define P11PROV_PKCS11_MODULE_ALLOW_EXPORT "pkcs11-module-allow-export"
-#define P11PROV_PKCS11_MODULE_LOGIN_BEHAVIOR "pkcs11-module-login-behavior"
-
 #define P11PROV_DEFAULT_PROPERTIES "provider=pkcs11"
 #define P11PROV_NAME_RSA "RSA"
 #define P11PROV_NAMES_RSA "RSA:rsaEncryption:1.2.840.113549.1.1.1"
@@ -76,6 +70,7 @@ typedef struct p11prov_slot P11PROV_SLOT;
 typedef struct p11prov_slots_ctx P11PROV_SLOTS_CTX;
 typedef struct p11prov_session P11PROV_SESSION;
 typedef struct p11prov_session_pool P11PROV_SESSION_POOL;
+typedef struct p11prov_obj_pool P11PROV_OBJ_POOL;
 
 /* Provider ctx */
 P11PROV_INTERFACE *p11prov_ctx_get_interface(P11PROV_CTX *ctx);
@@ -97,6 +92,13 @@ int p11prov_ctx_allow_export(P11PROV_CTX *ctx);
 #define PUBKEY_LOGIN_ALWAYS 1
 #define PUBKEY_LOGIN_NEVER 2
 int p11prov_ctx_login_behavior(P11PROV_CTX *ctx);
+bool p11prov_ctx_cache_pins(P11PROV_CTX *ctx);
+
+enum p11prov_cache_keys {
+    P11PROV_CACHE_KEYS_NEVER = 0,
+    P11PROV_CACHE_KEYS_IN_SESSION,
+};
+int p11prov_ctx_cache_keys(P11PROV_CTX *ctx);
 
 #include "debug.h"
 
@@ -111,6 +113,10 @@ void p11prov_raise(P11PROV_CTX *ctx, const char *file, int line,
         P11PROV_debug("Error: 0x%08lX; " format, (unsigned long)(errnum), \
                       ##__VA_ARGS__); \
     } while (0)
+
+int p11prov_set_error_mark(P11PROV_CTX *ctx);
+int p11prov_clear_last_error_mark(P11PROV_CTX *ctx);
+int p11prov_pop_error_to_mark(P11PROV_CTX *ctx);
 
 /* dispatching */
 #define DECL_DISPATCH_FUNC(type, prefix, name) \
@@ -128,6 +134,7 @@ void p11prov_raise(P11PROV_CTX *ctx, const char *file, int line,
 #include "digests.h"
 #include "util.h"
 #include "session.h"
+#include "slot.h"
 
 /* TLS */
 int tls_group_capabilities(OSSL_CALLBACK *cb, void *arg);

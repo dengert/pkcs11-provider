@@ -13,6 +13,7 @@ struct p11prov_ctx {
     enum {
         P11PROV_UNINITIALIZED = 0,
         P11PROV_INITIALIZED,
+        P11PROV_NEEDS_REINIT,
         P11PROV_IN_ERROR,
     } status;
 
@@ -26,6 +27,8 @@ struct p11prov_ctx {
     char *pin;
     int allow_export;
     int login_behavior;
+    bool cache_pins;
+    int cache_keys;
     /* TODO: ui_method */
     /* TODO: fork id */
 
@@ -44,6 +47,174 @@ struct p11prov_ctx {
     struct quirk *quirks;
     int nquirks;
 };
+
+static struct p11prov_context_pool {
+    struct p11prov_ctx **contexts;
+    int num;
+
+    pthread_rwlock_t rwlock;
+} ctx_pool = {
+    .contexts = NULL,
+    .num = 0,
+    .rwlock = PTHREAD_RWLOCK_INITIALIZER,
+};
+
+static void fork_prepare(void)
+{
+    int err;
+
+    err = pthread_rwlock_rdlock(&ctx_pool.rwlock);
+    if (err != 0) {
+        err = errno;
+        P11PROV_debug("Can't lock contexts pool (error=%d)", err);
+    }
+
+    for (int i = 0; i < ctx_pool.num; i++) {
+        if (ctx_pool.contexts[i]->status == P11PROV_INITIALIZED) {
+            p11prov_slot_fork_prepare(ctx_pool.contexts[i]->slots);
+        }
+    }
+}
+
+static void fork_parent(void)
+{
+    int err;
+
+    for (int i = 0; i < ctx_pool.num; i++) {
+        if (ctx_pool.contexts[i]->status == P11PROV_INITIALIZED) {
+            p11prov_slot_fork_release(ctx_pool.contexts[i]->slots);
+        }
+    }
+    err = pthread_rwlock_unlock(&ctx_pool.rwlock);
+    if (err != 0) {
+        err = errno;
+        P11PROV_debug("Failed to release context pool (errno:%d)", err);
+    }
+}
+
+static void fork_child(void)
+{
+    int err;
+
+    /* rwlock, saves TID internally, so we need to reset
+     * after fork in the child */
+    p11prov_force_rwlock_reinit(&ctx_pool.rwlock);
+
+    /* This is running in the fork handler, so there should be no
+     * way to have other threads running, but just in case some
+     * crazy library creates threads in their child handler */
+    err = pthread_rwlock_wrlock(&ctx_pool.rwlock);
+    if (err != 0) {
+        err = errno;
+        P11PROV_debug("Failed to get slots lock (errno:%d)", err);
+        return;
+    }
+
+    for (int i = 0; i < ctx_pool.num; i++) {
+        if (ctx_pool.contexts[i]->status == P11PROV_INITIALIZED) {
+            /* can't re-init in the fork handler, mark it */
+            ctx_pool.contexts[i]->status = P11PROV_NEEDS_REINIT;
+            p11prov_slot_fork_reset(ctx_pool.contexts[i]->slots);
+        }
+    }
+
+    err = pthread_rwlock_unlock(&ctx_pool.rwlock);
+    if (err != 0) {
+        err = errno;
+        P11PROV_debug("Failed to release context pool (errno:%d)", err);
+    }
+}
+
+#define CTX_POOL_ALLOC 4
+static void context_add_pool(struct p11prov_ctx *ctx)
+{
+    int err;
+    /* init static pool for atfork/atexit handling */
+    err = pthread_rwlock_wrlock(&ctx_pool.rwlock);
+    if (err != 0) {
+        /* just warn */
+        err = errno;
+        P11PROV_raise(ctx, CKR_CANT_LOCK, "Failed to lock ctx pool (error:%d)",
+                      err);
+        return;
+    }
+
+    /* WRLOCKED ------------------------------------------------- */
+    if (ctx_pool.contexts == NULL) {
+        ctx_pool.contexts =
+            OPENSSL_zalloc(CTX_POOL_ALLOC * sizeof(P11PROV_CTX *));
+        if (!ctx_pool.contexts) {
+            P11PROV_raise(ctx, CKR_HOST_MEMORY, "Failed to alloc ctx pool");
+            goto done;
+        }
+        err = pthread_atfork(fork_prepare, fork_parent, fork_child);
+        if (err != 0) {
+            /* just warn, nothing much we can do */
+            P11PROV_raise(ctx, CKR_GENERAL_ERROR,
+                          "Failed to register fork handlers (error:%d)", err);
+        }
+    } else {
+        if (ctx_pool.num % CTX_POOL_ALLOC == 0) {
+            P11PROV_CTX **tmp;
+            tmp = OPENSSL_realloc(ctx_pool.contexts,
+                                  (ctx_pool.num + CTX_POOL_ALLOC)
+                                      * sizeof(P11PROV_CTX *));
+            if (!tmp) {
+                P11PROV_raise(ctx, CKR_HOST_MEMORY,
+                              "Failed to realloc ctx pool");
+                goto done;
+            }
+            ctx_pool.contexts = tmp;
+        }
+    }
+    ctx_pool.contexts[ctx_pool.num] = ctx;
+    ctx_pool.num++;
+
+done:
+    /* ------------------------------------------------- WRLOCKED */
+    (void)pthread_rwlock_unlock(&ctx_pool.rwlock);
+    return;
+}
+
+static void context_rm_pool(struct p11prov_ctx *ctx)
+{
+    int found = false;
+    int err;
+
+    /* init static pool for atfork/atexit handling */
+    err = pthread_rwlock_wrlock(&ctx_pool.rwlock);
+    if (err != 0) {
+        /* just warn */
+        err = errno;
+        P11PROV_raise(ctx, CKR_CANT_LOCK, "Failed to lock ctx pool (error:%d)",
+                      err);
+        return;
+    }
+
+    /* WRLOCKED ------------------------------------------------- */
+    for (int i = 0; i < ctx_pool.num; i++) {
+        if (!found) {
+            if (ctx_pool.contexts[i] == ctx) {
+                ctx_pool.contexts[i] = NULL;
+                found = true;
+            }
+        } else {
+            ctx_pool.contexts[i - 1] = ctx_pool.contexts[i];
+            if (i == ctx_pool.num - 1) {
+                ctx_pool.contexts[i] = NULL;
+            }
+        }
+    }
+    if (found) {
+        ctx_pool.num--;
+    } else {
+        P11PROV_debug("Context not found in pool ?!");
+    }
+
+    /* ------------------------------------------------- WRLOCKED */
+    (void)pthread_rwlock_unlock(&ctx_pool.rwlock);
+    return;
+}
 
 struct quirk {
     CK_SLOT_ID id;
@@ -262,6 +433,15 @@ CK_RV p11prov_ctx_status(P11PROV_CTX *ctx)
     case P11PROV_INITIALIZED:
         ret = CKR_OK;
         break;
+    case P11PROV_NEEDS_REINIT:
+        ret = p11prov_module_reinit(ctx->module);
+        if (ret != CKR_OK) {
+            P11PROV_raise(ctx, ret, "Module re-initialization failed!");
+            ctx->status = P11PROV_IN_ERROR;
+            break;
+        }
+        ctx->status = P11PROV_INITIALIZED;
+        break;
     case P11PROV_IN_ERROR:
         P11PROV_raise(ctx, CKR_GENERAL_ERROR, "Module in error state!");
         ret = CKR_GENERAL_ERROR;
@@ -322,6 +502,9 @@ static void p11prov_ctx_free(P11PROV_CTX *ctx)
         OPENSSL_free(ctx->quirks);
     }
 
+    /* remove from pool */
+    context_rm_pool(ctx);
+
     ret = pthread_rwlock_unlock(&ctx->rwlock);
     if (ret != 0) {
         P11PROV_raise(ctx, CKR_CANT_LOCK,
@@ -350,6 +533,18 @@ int p11prov_ctx_login_behavior(P11PROV_CTX *ctx)
     return ctx->login_behavior;
 }
 
+bool p11prov_ctx_cache_pins(P11PROV_CTX *ctx)
+{
+    P11PROV_debug("cache_pins = %s", ctx->cache_pins ? "true" : "false");
+    return ctx->cache_pins;
+}
+
+int p11prov_ctx_cache_keys(P11PROV_CTX *ctx)
+{
+    P11PROV_debug("cache_keys = %d", ctx->cache_keys);
+    return ctx->cache_keys;
+}
+
 static void p11prov_teardown(void *ctx)
 {
     p11prov_ctx_free((P11PROV_CTX *)ctx);
@@ -359,6 +554,10 @@ static OSSL_FUNC_core_get_params_fn *core_get_params = NULL;
 static OSSL_FUNC_core_new_error_fn *core_new_error = NULL;
 static OSSL_FUNC_core_set_error_debug_fn *core_set_error_debug = NULL;
 static OSSL_FUNC_core_vset_error_fn *core_vset_error = NULL;
+static OSSL_FUNC_core_set_error_mark_fn *core_set_error_mark = NULL;
+static OSSL_FUNC_core_clear_last_error_mark_fn *core_clear_last_error_mark =
+    NULL;
+static OSSL_FUNC_core_pop_error_to_mark_fn *core_pop_error_to_mark = NULL;
 
 static void p11prov_get_core_dispatch_funcs(const OSSL_DISPATCH *in)
 {
@@ -377,6 +576,16 @@ static void p11prov_get_core_dispatch_funcs(const OSSL_DISPATCH *in)
             break;
         case OSSL_FUNC_CORE_VSET_ERROR:
             core_vset_error = OSSL_FUNC_core_vset_error(iter_in);
+            break;
+        case OSSL_FUNC_CORE_SET_ERROR_MARK:
+            core_set_error_mark = OSSL_FUNC_core_set_error_mark(iter_in);
+            break;
+        case OSSL_FUNC_CORE_CLEAR_LAST_ERROR_MARK:
+            core_clear_last_error_mark =
+                OSSL_FUNC_core_clear_last_error_mark(iter_in);
+            break;
+        case OSSL_FUNC_CORE_POP_ERROR_TO_MARK:
+            core_pop_error_to_mark = OSSL_FUNC_core_pop_error_to_mark(iter_in);
             break;
         default:
             /* Just ignore anything we don't understand */
@@ -399,6 +608,21 @@ void p11prov_raise(P11PROV_CTX *ctx, const char *file, int line,
     core_set_error_debug(ctx->handle, file, line, func);
     core_vset_error(ctx->handle, errnum, fmt, args);
     va_end(args);
+}
+
+int p11prov_set_error_mark(P11PROV_CTX *ctx)
+{
+    return core_set_error_mark(ctx->handle);
+}
+
+int p11prov_clear_last_error_mark(P11PROV_CTX *ctx)
+{
+    return core_clear_last_error_mark(ctx->handle);
+}
+
+int p11prov_pop_error_to_mark(P11PROV_CTX *ctx)
+{
+    return core_pop_error_to_mark(ctx->handle);
 }
 
 /* Parameters we provide to the core */
@@ -971,15 +1195,32 @@ static const OSSL_DISPATCH p11prov_dispatch_table[] = {
     { 0, NULL },
 };
 
+enum p11prov_cfg_enum {
+    P11PROV_CFG_PATH = 0,
+    P11PROV_CFG_INIT_ARGS,
+    P11PROV_CFG_TOKEN_PIN,
+    P11PROV_CFG_ALLOW_EXPORT,
+    P11PROV_CFG_LOGIN_BEHAVIOR,
+    P11PROV_CFG_LOAD_BEHAVIOR,
+    P11PROV_CFG_CACHE_PINS,
+    P11PROV_CFG_CACHE_KEYS,
+    P11PROV_CFG_SIZE,
+};
+
+static struct p11prov_cfg_names {
+    const char *name;
+} p11prov_cfg_names[P11PROV_CFG_SIZE] = {
+    { "pkcs11-module-path" },           { "pkcs11-module-init-args" },
+    { "pkcs11-module-token-pin" },      { "pkcs11-module-allow-export" },
+    { "pkcs11-module-login-behavior" }, { "pkcs11-module-load-behavior" },
+    { "pkcs11-module-cache-pins" },     { "pkcs11-module-cache-keys" },
+};
+
 int OSSL_provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH *in,
                        const OSSL_DISPATCH **out, void **provctx)
 {
-    OSSL_PARAM core_params[6] = { 0 };
-    const char *path = NULL;
-    const char *init_args = NULL;
-    char *allow_export = NULL;
-    char *login_behavior = NULL;
-    char *pin = NULL;
+    const char *cfg[P11PROV_CFG_SIZE] = { 0 };
+    OSSL_PARAM core_params[P11PROV_CFG_SIZE + 1];
     P11PROV_CTX *ctx;
     int ret;
 
@@ -1007,21 +1248,12 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH *in,
         return RET_OSSL_ERR;
     }
 
-    /* get module path */
-    core_params[0] = OSSL_PARAM_construct_utf8_ptr(
-        P11PROV_PKCS11_MODULE_PATH, (char **)&path, sizeof(path));
-    core_params[1] =
-        OSSL_PARAM_construct_utf8_ptr(P11PROV_PKCS11_MODULE_INIT_ARGS,
-                                      (char **)&init_args, sizeof(init_args));
-    core_params[2] = OSSL_PARAM_construct_utf8_ptr(
-        P11PROV_PKCS11_MODULE_TOKEN_PIN, &pin, sizeof(pin));
-    core_params[3] =
-        OSSL_PARAM_construct_utf8_ptr(P11PROV_PKCS11_MODULE_ALLOW_EXPORT,
-                                      &allow_export, sizeof(allow_export));
-    core_params[4] =
-        OSSL_PARAM_construct_utf8_ptr(P11PROV_PKCS11_MODULE_LOGIN_BEHAVIOR,
-                                      &login_behavior, sizeof(login_behavior));
-    core_params[5] = OSSL_PARAM_construct_end();
+    for (int i = 0; i < P11PROV_CFG_SIZE; i++) {
+        core_params[i] = OSSL_PARAM_construct_utf8_ptr(
+            p11prov_cfg_names[i].name, (char **)&cfg[i], sizeof(void *));
+    }
+    core_params[P11PROV_CFG_SIZE] = OSSL_PARAM_construct_end();
+
     ret = core_get_params(handle, core_params);
     if (ret != RET_OSSL_OK) {
         ERR_raise(ERR_LIB_PROV, PROV_R_FAILED_TO_GET_PARAMETER);
@@ -1029,15 +1261,16 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH *in,
         return ret;
     }
 
-    ret = p11prov_module_new(ctx, path, init_args, &ctx->module);
+    ret = p11prov_module_new(ctx, cfg[P11PROV_CFG_PATH],
+                             cfg[P11PROV_CFG_INIT_ARGS], &ctx->module);
     if (ret != CKR_OK) {
         ERR_raise(ERR_LIB_PROV, PROV_R_IN_ERROR_STATE);
         p11prov_ctx_free(ctx);
         return RET_OSSL_ERR;
     }
 
-    if (pin != NULL) {
-        ret = p11prov_get_pin(pin, &ctx->pin);
+    if (cfg[P11PROV_CFG_TOKEN_PIN] != NULL) {
+        ret = p11prov_get_pin(cfg[P11PROV_CFG_TOKEN_PIN], &ctx->pin);
         if (ret != 0) {
             ERR_raise(ERR_LIB_PROV, PROV_R_IN_ERROR_STATE);
             p11prov_ctx_free(ctx);
@@ -1045,34 +1278,66 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH *in,
         }
     }
 
-    if (allow_export != NULL) {
+    if (cfg[P11PROV_CFG_ALLOW_EXPORT] != NULL) {
         char *end = NULL;
         errno = 0;
-        ctx->allow_export = (int)strtol(allow_export, &end, 0);
+        ctx->allow_export = (int)strtol(cfg[P11PROV_CFG_ALLOW_EXPORT], &end, 0);
         if (errno != 0 || *end != '\0') {
             P11PROV_raise(ctx, CKR_GENERAL_ERROR, "Invalid value for %s: (%s)",
-                          P11PROV_PKCS11_MODULE_ALLOW_EXPORT, allow_export);
+                          p11prov_cfg_names[P11PROV_CFG_ALLOW_EXPORT].name,
+                          cfg[P11PROV_CFG_ALLOW_EXPORT]);
             p11prov_ctx_free(ctx);
             return RET_OSSL_ERR;
         }
     }
 
-    if (login_behavior != NULL) {
-        if (strcmp(login_behavior, "auto") == 0) {
+    if (cfg[P11PROV_CFG_LOGIN_BEHAVIOR] != NULL) {
+        if (strcmp(cfg[P11PROV_CFG_LOGIN_BEHAVIOR], "auto") == 0) {
             ctx->login_behavior = PUBKEY_LOGIN_AUTO;
-        } else if (strcmp(login_behavior, "always") == 0) {
+        } else if (strcmp(cfg[P11PROV_CFG_LOGIN_BEHAVIOR], "always") == 0) {
             ctx->login_behavior = PUBKEY_LOGIN_ALWAYS;
-        } else if (strcmp(login_behavior, "never") == 0) {
+        } else if (strcmp(cfg[P11PROV_CFG_LOGIN_BEHAVIOR], "never") == 0) {
             ctx->login_behavior = PUBKEY_LOGIN_NEVER;
         } else {
             P11PROV_raise(ctx, CKR_GENERAL_ERROR, "Invalid value for %s: (%s)",
-                          P11PROV_PKCS11_MODULE_LOGIN_BEHAVIOR, login_behavior);
+                          p11prov_cfg_names[P11PROV_CFG_LOGIN_BEHAVIOR].name,
+                          cfg[P11PROV_CFG_LOGIN_BEHAVIOR]);
             p11prov_ctx_free(ctx);
             return RET_OSSL_ERR;
         }
     }
 
+    if (cfg[P11PROV_CFG_CACHE_PINS] != NULL
+        && strcmp(cfg[P11PROV_CFG_CACHE_PINS], "cache") == 0) {
+        ctx->cache_pins = true;
+    }
+
+    if (cfg[P11PROV_CFG_CACHE_KEYS] != NULL) {
+        if (strcmp(cfg[P11PROV_CFG_CACHE_KEYS], "true") == 0) {
+            ctx->cache_keys = P11PROV_CACHE_KEYS_IN_SESSION;
+        } else if (strcmp(cfg[P11PROV_CFG_CACHE_KEYS], "false") == 0) {
+            ctx->cache_keys = P11PROV_CACHE_KEYS_NEVER;
+        }
+    } else {
+        /* defaults to session */
+        ctx->cache_keys = P11PROV_CACHE_KEYS_IN_SESSION;
+    }
+
+    /* do this as the last thing */
+    if (cfg[P11PROV_CFG_LOAD_BEHAVIOR] != NULL
+        && strcmp(cfg[P11PROV_CFG_LOAD_BEHAVIOR], "early") == 0) {
+        /* this triggers early module loading */
+        ret = p11prov_ctx_status(ctx);
+        if (ret != CKR_OK) {
+            p11prov_ctx_free(ctx);
+            return RET_OSSL_ERR;
+        }
+    }
+
+    /* done */
+    ret = RET_OSSL_OK;
+    context_add_pool(ctx);
     *out = p11prov_dispatch_table;
     *provctx = ctx;
-    return RET_OSSL_OK;
+    return ret;
 }
