@@ -4,10 +4,8 @@
 #ifndef _PROVIDER_H
 #define _PROVIDER_H
 
-/* on macOS, snprintf and vsnprintf are in -D_XOPEN_SOURCE=600. This may be
- * a bug in macOS' headers, or a deliberate choice because snprintf changed
- * behavior with X/Open 6. */
-#define _XOPEN_SOURCE 600
+/* We need at least -D_XOPEN_SOURCE=700 for strnlen. */
+#define _XOPEN_SOURCE 700
 #include "config.h"
 
 #include <stdbool.h>
@@ -56,6 +54,8 @@
 #define P11PROV_NAMES_ED448 "ED448:1.3.101.113"
 #define P11PROV_NAME_ED448 "ED448"
 #define P11PROV_DESCS_ED448 "PKCS11 ED448 Implementation"
+#define P11PROV_NAMES_RAND "PKCS11-RAND"
+#define P11PROV_DESCS_RAND "PKCS11 Random Generator"
 
 #define P11PROV_PARAM_KEY_LABEL "pkcs11_key_label"
 #define P11PROV_PARAM_KEY_ID "pkcs11_key_id"
@@ -135,6 +135,7 @@ int p11prov_pop_error_to_mark(P11PROV_CTX *ctx);
 #include "util.h"
 #include "session.h"
 #include "slot.h"
+#include "random.h"
 
 /* TLS */
 int tls_group_capabilities(OSSL_CALLBACK *cb, void *arg);
