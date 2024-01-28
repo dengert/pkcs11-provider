@@ -23,6 +23,7 @@ struct p11prov_module_ctx {
 
     pthread_mutex_t lock;
     bool initialized;
+    bool reinit;
 };
 
 /* This structure is effectively equivalent to CK_FUNCTION_LIST_3_0
@@ -154,6 +155,7 @@ static CK_RV p11prov_interface_init(P11PROV_MODULE *mctx)
 {
     /* Try to get 3.0 interface by default */
     P11PROV_INTERFACE *intf;
+    CK_UTF8CHAR_PTR intf_name = (CK_UTF8CHAR_PTR) "PKCS 11";
     CK_VERSION version = { 3, 0 };
     CK_INTERFACE *ck_interface;
     CK_RV ret;
@@ -174,7 +176,7 @@ static CK_RV p11prov_interface_init(P11PROV_MODULE *mctx)
         intf->GetInterface = p11prov_NO_GetInterface;
     }
 
-    ret = intf->GetInterface(NULL, &version, &ck_interface, 0);
+    ret = intf->GetInterface(intf_name, &version, &ck_interface, 0);
     if (ret != CKR_OK && ret != CKR_FUNCTION_NOT_SUPPORTED) {
         /* retry without asking for specific version */
         ret = intf->GetInterface(NULL, NULL, &ck_interface, 0);
@@ -289,7 +291,8 @@ CK_RV p11prov_module_init(P11PROV_MODULE *mctx)
     P11PROV_debug("PKCS#11: Initializing the module: %s", mctx->path);
 
     dlerror();
-    mctx->dlhandle = dlopen(mctx->path, RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
+
+    mctx->dlhandle = dlopen(mctx->path, P11PROV_DLOPEN_FLAGS);
     if (!mctx->dlhandle) {
         char *err = dlerror();
         ret = CKR_GENERAL_ERROR;
@@ -362,6 +365,12 @@ void p11prov_module_free(P11PROV_MODULE *mctx)
     OPENSSL_free(mctx);
 }
 
+/* should only be called by the fork handler */
+void p11prov_module_mark_reinit(P11PROV_MODULE *mctx)
+{
+    mctx->reinit = true;
+}
+
 CK_RV p11prov_module_reinit(P11PROV_MODULE *mctx)
 {
     CK_C_INITIALIZE_ARGS args = { 0 };
@@ -378,6 +387,11 @@ CK_RV p11prov_module_reinit(P11PROV_MODULE *mctx)
     }
 
     /* LOCKED SECTION ------------- */
+    if (!mctx->reinit) {
+        /* another thread already did it */
+        goto done;
+    }
+
     P11PROV_debug("PKCS#11: Re-initializing the module: %s", mctx->path);
 
     (void)p11prov_Finalize(mctx->provctx, NULL);
@@ -392,6 +406,9 @@ CK_RV p11prov_module_reinit(P11PROV_MODULE *mctx)
         P11PROV_debug("PKCS#11: Re-init failed: %lx", ret);
         goto done;
     }
+
+    /* clear reinit flag as we just did re-initialize */
+    mctx->reinit = false;
 
     ret = p11prov_GetInfo(mctx->provctx, &ck_info);
     if (ret != CKR_OK) {
@@ -432,4 +449,28 @@ done:
     (void)MUTEX_UNLOCK(mctx);
     /* ------------- LOCKED SECTION */
     return ret;
+}
+
+/* This is needed to avoid side channels in the PKCS 1.5 decryption case */
+CK_RV side_channel_free_Decrypt(P11PROV_CTX *ctx, CK_SESSION_HANDLE hSession,
+                                CK_BYTE_PTR pEncryptedData,
+                                CK_ULONG ulEncryptedDataLen, CK_BYTE_PTR pData,
+                                CK_ULONG_PTR pulDataLen)
+{
+    P11PROV_INTERFACE *intf = p11prov_ctx_get_interface(ctx);
+    CK_RV ret = CKR_GENERAL_ERROR;
+    if (!intf) {
+        P11PROV_raise(ctx, ret, "Can't get module interfaces");
+        return ret;
+    }
+    P11PROV_debug("Calling C_Decrypt");
+    /* Must not add any conditionals based on return value, so we just return
+     * straight */
+    return intf->Decrypt(hSession, pEncryptedData, ulEncryptedDataLen, pData,
+                         pulDataLen);
+}
+
+CK_INFO p11prov_module_ck_info(P11PROV_MODULE *mctx)
+{
+    return mctx->ck_info;
 }

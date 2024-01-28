@@ -1,10 +1,10 @@
 ACLOCAL_AMFLAGS = -Im4
 
-SUBDIRS = src tests
-dist_doc_DATA = README
+SUBDIRS = src tests docs
+dist_doc_DATA = README.md
 
 check-style:
-	@lines=`git diff -U0 --no-color --relative origin/main | clang-format-diff -p1 |wc -l`; \
+	@lines=`git diff -U0 --no-color --relative origin/main -- ':!src/pkcs11.h' | clang-format-diff -p1 |wc -l`; \
 	if [ "$$lines" != "0" ]; then \
 		echo "Coding Style issues detected"; \
 		exit 1; \
@@ -13,10 +13,10 @@ check-style:
 	fi
 
 check-style-show:
-	git diff -U0 --no-color --relative origin/main | clang-format-diff -p1
+	git diff -U0 --no-color --relative origin/main -- ':!src/pkcs11.h' | clang-format-diff -p1
 
 check-style-fix:
-	git diff -U0 --no-color --relative origin/main | clang-format-diff -i -p1
+	git diff -U0 --no-color --relative origin/main -- ':!src/pkcs11.h' | clang-format-diff -i -p1
 
 generate-code:
 	for pfile in src/*.pre; do \
@@ -29,6 +29,13 @@ generate-code:
 		cat "$${gfile}.tmp" >> $${gfile}; \
 		clang-format -i --verbose "$${gfile}"; \
 		rm "$${gfile}.tmp"; \
+	done
+
+generate-docs:
+	for mdfile in docs/*.md; do \
+		echo "Processing $${mdfile}"; \
+		manfile=`echo $${mdfile} | sed s/\.md//`; \
+		pandoc --standalone --to man $${mdfile} -o $${manfile}; \
 	done
 
 DISTCLEANFILES = \

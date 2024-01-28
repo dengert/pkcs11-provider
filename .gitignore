@@ -4,6 +4,7 @@ tests/openssl.cnf.softhsm
 tests/tmp.softhsm
 tests/tmp.softokn
 tests/tdigests
+tests/tdigest_dupctx
 tests/tsession
 tests/tgenkey
 tests/treadkeys
@@ -13,6 +14,7 @@ tests/*.trs
 tests/pincache
 tests/tfork
 tests/tlsctx
+tests/tcmpkeys
 
 /pkcs11-provider-?.?/
 /pkcs11-provider-?.?.tar.?z

@@ -2,10 +2,10 @@
 # Copyright (C) 2022 Simo Sorce <simo@redhat.com>
 # SPDX-License-Identifier: Apache-2.0
 
-source ${TESTSSRCDIR}/helpers.sh
+source "${TESTSSRCDIR}/helpers.sh"
 
 title PARA "Raw Sign check error"
-dd if=/dev/urandom of=${TMPPDIR}/64Brandom.bin bs=64 count=1 >/dev/null 2>&1
+dd if=/dev/urandom of="${TMPPDIR}/64Brandom.bin" bs=64 count=1 >/dev/null 2>&1
 FAIL=0
 ossl '
 pkeyutl -sign -inkey "${BASEURI}"
@@ -69,7 +69,7 @@ pkeyutl -verify -inkey "${PUBURI}"
 
 
 SECRETFILE=${TMPPDIR}/rsasecret.txt
-echo "Super Secret" > ${SECRETFILE}
+echo "Super Secret" > "${SECRETFILE}"
 
 title LINE "RSA basic encrypt and decrypt"
 ossl '
@@ -80,13 +80,13 @@ ossl '
 pkeyutl -decrypt -inkey "${PRIURI}"
                  -in ${SECRETFILE}.enc
                  -out ${SECRETFILE}.dec'
-diff ${SECRETFILE} ${SECRETFILE}.dec
+diff "${SECRETFILE}" "${SECRETFILE}.dec"
 
 title PARA "Test Disallow Public Export"
 ORIG_OPENSSL_CONF=${OPENSSL_CONF}
-sed "s/#pkcs11-module-allow-export/pkcs11-module-allow-export = 1/" ${OPENSSL_CONF} > ${OPENSSL_CONF}.noexport
+sed "s/#pkcs11-module-allow-export/pkcs11-module-allow-export = 1/" "${OPENSSL_CONF}" > "${OPENSSL_CONF}.noexport"
 OPENSSL_CONF=${OPENSSL_CONF}.noexport
-ossl 'pkey -in $PUBURI -pubin -pubout -text' $helper_emit
+ossl 'pkey -in $PUBURI -pubin -pubout -text' "$helper_emit"
 output="$helper_output"
 FAIL=0
 echo "$output" | grep "^PKCS11 RSA Public Key (2048 bits)" > /dev/null 2>&1 || FAIL=1
@@ -107,7 +107,6 @@ if [ $FAIL -ne 0 ]; then
     exit 1
 fi
 OPENSSL_CONF=${ORIG_OPENSSL_CONF}
-rm -f ${OPENSSL_CONF}.noexport
 
 title PARA "Test CSR generation from RSA private keys"
 ossl '
@@ -117,23 +116,25 @@ req -in ${TMPPDIR}/rsa_csr.pem -verify -noout'
 
 title PARA "Test fetching public keys without PIN in config files"
 ORIG_OPENSSL_CONF=${OPENSSL_CONF}
-sed "s/^pkcs11-module-token-pin.*$/##nopin/" ${OPENSSL_CONF} > ${OPENSSL_CONF}.nopin
+sed "s/^pkcs11-module-token-pin.*$/##nopin/" "${OPENSSL_CONF}" > "${OPENSSL_CONF}.nopin"
 OPENSSL_CONF=${OPENSSL_CONF}.nopin
 ossl 'pkey -in $PUBURI -pubin -pubout -out ${TMPPDIR}/rsa.pub.nopin.pem'
 ossl 'pkey -in $ECPUBURI -pubin -pubout -out ${TMPPDIR}/ec.pub.nopin.pem'
+[[ -n $ECXPUBURI ]] && ossl 'pkey -in $ECXPUBURI -pubin -pubout -out ${TMPPDIR}/ecx.pub.nopin.pem'
 
 title PARA "Test fetching public keys with a PIN in URI"
 ossl 'pkey -in $BASEURIWITHPIN -pubin -pubout -out ${TMPPDIR}/rsa.pub.uripin.pem'
 ossl 'pkey -in $ECBASEURIWITHPIN -pubin -pubout -out ${TMPPDIR}/ec.pub.uripin.pem'
+[[ -n $ECXBASEURIWITHPIN ]] && ossl 'pkey -in $ECXBASEURIWITHPIN -pubin -pubout -out ${TMPPDIR}/ecx.pub.uripin.pem'
 
 title PARA "Test prompting without PIN in config files"
-output=`expect -c "spawn -noecho openssl pkey -in \"${PRIURI}\" -text -noout;
+output=$(expect -c "spawn -noecho $CHECKER openssl pkey -in \"${PRIURI}\" -text -noout;
                    expect \"Enter pass phrase for PKCS#11 Token (Slot *:\";
                    send \"${PINVALUE}\r\";
-                   expect \"Key ID:\";"`
+                   expect \"Key ID:\";")
 echo "$output" | grep "Enter pass phrase for PKCS#11 Token (Slot .*):" > /dev/null 2>&1 || FAIL=1
 if [ $FAIL -eq 0 ]; then
-    echo "$output" | grep "PKCS11 RSA Public Key" > /dev/null 2>&1 || FAIL=2
+    echo "$output" | grep "PKCS11 RSA Private Key" > /dev/null 2>&1 || FAIL=2
 fi
 if [ $FAIL -eq 1 ]; then
     echo "Failed to obtain expected prompt"
@@ -150,14 +151,120 @@ if [ $FAIL -ne 0 ]; then
 fi
 
 OPENSSL_CONF=${ORIG_OPENSSL_CONF}
-rm -f ${OPENSSL_CONF}.nopin
+
+title PARA "Test EVP_PKEY_eq on public RSA key both on token"
+$CHECKER ./tcmpkeys "$PUBURI" "$PUBURI"
+title PARA "Test EVP_PKEY_eq on public EC key both on token"
+# shellcheck disable=SC2153 # ECURIs and ECXURIs are not spelling errors
+$CHECKER ./tcmpkeys "$ECPUBURI" "$ECPUBURI"
+if [[ -n $ECXPUBURI ]]; then
+    title PARA "Test EVP_PKEY_eq on public explicit EC key both on token"
+    $CHECKER ./tcmpkeys "$ECXPUBURI" "$ECXPUBURI"
+fi
+
+# It's important to test the commutative property since in the
+# first case the private key (its public part) is exported from
+# pkcs11 keymgmt and matched using the openssl's keymgmt while
+# in the second case it's the other way around.
+
+title PARA "Test EVP_PKEY_eq on public RSA key via import"
+$CHECKER ./tcmpkeys "$PUBURI" "${TMPPDIR}"/rsa.pub.uripin.pem
+title PARA "Match private RSA key against public key"
+$CHECKER ./tcmpkeys "$PRIURI" "${TMPPDIR}"/rsa.pub.uripin.pem
+title PARA "Match private RSA key against public key (commutativity)"
+$CHECKER ./tcmpkeys "${TMPPDIR}"/rsa.pub.uripin.pem "$PRIURI"
+
+title PARA "Test EVP_PKEY_eq on public EC key via import"
+$CHECKER ./tcmpkeys "$ECPUBURI" "${TMPPDIR}"/ec.pub.uripin.pem
+title PARA "Match private EC key against public key"
+$CHECKER ./tcmpkeys "$ECPRIURI" "${TMPPDIR}"/ec.pub.uripin.pem
+title PARA "Match private EC key against public key (commutativity)"
+$CHECKER ./tcmpkeys "${TMPPDIR}"/ec.pub.uripin.pem "$ECPRIURI"
+
+if [[ -n $ECXPUBURI ]]; then
+    echo "ECXPUBURI is $ECXPUBURI"
+    title PARA "Test EVP_PKEY_eq on public explicit EC key via import"
+    $CHECKER ./tcmpkeys "$ECXPUBURI" "${TMPPDIR}"/ecx.pub.uripin.pem
+    title PARA "Match private explicit EC key against public key"
+    # shellcheck disable=SC2153 # ECURIs and ECXURIs are not spelling errors
+    $CHECKER ./tcmpkeys "$ECXPRIURI" "${TMPPDIR}"/ecx.pub.uripin.pem
+    title PARA "Match private explicit EC key against public key (commutativity)"
+    $CHECKER ./tcmpkeys "${TMPPDIR}"/ecx.pub.uripin.pem "$ECXPRIURI"
+fi
+
+title PARA "Test EVP_PKEY_eq with key exporting disabled"
+ORIG_OPENSSL_CONF=${OPENSSL_CONF}
+OPENSSL_CONF=${OPENSSL_CONF}.noexport
+title PARA "Test RSA key"
+$CHECKER ./tcmpkeys "$PUBURI" "$PUBURI"
+title PARA "Test EC key"
+$CHECKER ./tcmpkeys "$ECPUBURI" "$ECPUBURI"
+if [[ -n $ECXPUBURI ]]; then
+    title PARA "Test explicit EC key"
+    $CHECKER ./tcmpkeys "$ECXPUBURI" "$ECXPUBURI"
+fi
+OPENSSL_CONF=${ORIG_OPENSSL_CONF}
 
 title PARA "Test PIN caching"
 ORIG_OPENSSL_CONF=${OPENSSL_CONF}
-sed "s/^pkcs11-module-token-pin.*$/pkcs11-module-cache-pins = cache/" ${OPENSSL_CONF} > ${OPENSSL_CONF}.pincaching
+sed "s/^pkcs11-module-token-pin.*$/pkcs11-module-cache-pins = cache/" \
+    "${OPENSSL_CONF}" > "${OPENSSL_CONF}.pincaching"
 OPENSSL_CONF=${OPENSSL_CONF}.pincaching
-${TESTBLDDIR}/pincache
+$CHECKER "${TESTBLDDIR}/pincache"
+$CHECKER "${TESTBLDDIR}/pincache" "$ECPRIURI"
 OPENSSL_CONF=${ORIG_OPENSSL_CONF}
 
+OPENSSL_CONF=${OPENSSL_CONF}.nopin
+
+title PARA "Test interactive Login on key without ALWAYS AUTHENTICATE"
+output=$(expect -c "spawn -noecho $CHECKER ${TESTBLDDIR}/tsession \"$BASEURI\";
+                expect \"Enter PIN for PKCS#11 Token (Slot *:\" {
+                    send \"${PINVALUE}\r\"; exp_continue; }
+                expect \"ALL A-OK\";")
+FAIL=0
+echo "$output" | grep "Enter PIN for PKCS#11 Token (Slot .*):" > /dev/null 2>&1 || FAIL=1
+prompts=$(echo "$output" | grep -c "Enter PIN for PKCS#11 Token (Slot .*):" 2>&1)
+# 1 login to read key only
+if [ "$prompts" -ne "1" ]; then
+    echo "Failed receive expected amount of prompts (got $prompts, expected 1)"
+    FAIL=2
+fi
+if [ $FAIL -eq 1 ]; then
+    echo "Failed to obtain expected prompt"
+fi
+if [ $FAIL -ne 0 ]; then
+    echo
+    echo "Original command output:"
+    echo "$output"
+    echo
+    exit 1
+fi
+
+if [[ -n $ECBASE3URI ]]; then
+    title PARA "Test interactive Login repeated for operation on key with ALWAYS AUTHENTICATE"
+    output=$(expect -c "spawn -noecho $CHECKER ${TESTBLDDIR}/tsession \"$ECBASE3URI\";
+                    expect \"Enter PIN for PKCS#11 Token (Slot *:\" {
+                        send \"${PINVALUE}\r\"; exp_continue; }
+                    expect \"ALL A-OK\";")
+    FAIL=0
+    echo "$output" | grep "Enter PIN for PKCS#11 Token (Slot .*):" > /dev/null 2>&1 || FAIL=1
+    prompts=$(echo "$output" | grep -c "Enter PIN for PKCS#11 Token (Slot .*):"  2>&1)
+    # 1 login to read key + 16 signatures from 2 processes
+    if [ "$prompts" -ne "33" ]; then
+        echo "Failed receive expected amount of prompts (got $prompts, expected 33)"
+        FAIL=2
+    fi
+    if [ $FAIL -eq 1 ]; then
+        echo "Failed to obtain expected prompt"
+    fi
+    if [ $FAIL -ne 0 ]; then
+        echo
+        echo "Original command output:"
+        echo "$output"
+        echo
+        exit 1
+    fi
+fi
+OPENSSL_CONF=${ORIG_OPENSSL_CONF}
 
 exit 0

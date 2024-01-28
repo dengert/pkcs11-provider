@@ -118,10 +118,13 @@ static const char slot_desc_fmt[] = "PKCS#11 Token (Slot %lu - %s)";
 CK_RV p11prov_init_slots(P11PROV_CTX *ctx, P11PROV_SLOTS_CTX **slots)
 {
     CK_ULONG num;
+    CK_INFO ck_info;
     CK_SLOT_ID *slotid = NULL;
     struct p11prov_slots_ctx *sctx;
     CK_RV ret;
     int err;
+
+    ck_info = p11prov_ctx_get_ck_info(ctx);
 
     sctx = OPENSSL_zalloc(sizeof(P11PROV_SLOTS_CTX));
     if (!sctx) {
@@ -215,7 +218,10 @@ CK_RV p11prov_init_slots(P11PROV_CTX *ctx, P11PROV_SLOTS_CTX **slots)
             goto done;
         }
 
-        get_slot_profiles(ctx, slot);
+        /* profiles not available before version 3 */
+        if (ck_info.cryptokiVersion.major >= 3) {
+            get_slot_profiles(ctx, slot);
+        }
         get_slot_mechanisms(ctx, slot);
 
         P11PROV_debug_slot(ctx, slot->id, &slot->slot, &slot->token,
@@ -325,7 +331,7 @@ void p11prov_free_slots(P11PROV_SLOTS_CTX *sctx)
                                strlen(sctx->slots[i]->cached_pin));
         }
         OPENSSL_free(sctx->slots[i]->login_info);
-        OPENSSL_cleanse(sctx->slots[i], sizeof(P11PROV_SLOT));
+        OPENSSL_clear_free(sctx->slots[i], sizeof(P11PROV_SLOT));
     }
     OPENSSL_free(sctx->slots);
     OPENSSL_free(sctx);
@@ -458,6 +464,33 @@ CK_RV p11prov_slot_get_obj_pool(P11PROV_CTX *ctx, CK_SLOT_ID id,
     return ret;
 }
 
+CK_RV p11prov_slot_find_obj_pool(P11PROV_CTX *ctx, slot_pool_callback cb,
+                                 void *cb_ctx)
+{
+    P11PROV_SLOT *slot = NULL;
+    P11PROV_SLOTS_CTX *sctx;
+    bool found = false;
+    CK_RV ret;
+
+    ret = p11prov_take_slots(ctx, &sctx);
+    if (ret != CKR_OK) {
+        return ret;
+    }
+
+    for (int s = 0; s < sctx->num; s++) {
+        slot = sctx->slots[s];
+        if (slot->objects) {
+            found = cb(cb_ctx, slot->objects);
+        }
+        if (found) {
+            break;
+        }
+    }
+
+    p11prov_return_slots(sctx);
+    return CKR_OK;
+}
+
 CK_SLOT_ID p11prov_slot_get_slot_id(P11PROV_SLOT *slot)
 {
     return slot->id;
@@ -515,4 +548,9 @@ CK_RV p11prov_slot_set_cached_pin(P11PROV_SLOT *slot, const char *cached_pin)
 P11PROV_SESSION_POOL *p11prov_slot_get_session_pool(P11PROV_SLOT *slot)
 {
     return slot->pool;
+}
+
+bool p11prov_slot_check_req_login(P11PROV_SLOT *slot)
+{
+    return slot->token.flags & CKF_LOGIN_REQUIRED;
 }

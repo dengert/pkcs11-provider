@@ -12,6 +12,7 @@ struct p11prov_session {
 
     CK_SLOT_ID slotid;
     CK_SESSION_HANDLE session;
+    CK_STATE state;
     CK_FLAGS flags;
 
     pthread_mutex_t lock;
@@ -61,6 +62,7 @@ static CK_RV token_session_callback(CK_SESSION_HANDLE hSession,
 #define SLEEP 50000
 static CK_RV token_session_open(P11PROV_SESSION *session, CK_FLAGS flags)
 {
+    CK_SESSION_INFO session_info;
     uint64_t startime = 0;
     CK_RV ret;
 
@@ -78,11 +80,20 @@ static CK_RV token_session_open(P11PROV_SESSION *session, CK_FLAGS flags)
     if (ret != CKR_OK) {
         session->session = CK_INVALID_HANDLE;
         session->flags = DEFLT_SESSION_FLAGS;
+        session->state = CK_UNAVAILABLE_INFORMATION;
         return ret;
     }
 
     session->flags = flags;
-    return CKR_OK;
+
+    /* get current state */
+    ret = p11prov_GetSessionInfo(session->provctx, session->session,
+                                 &session_info);
+    if (ret == CKR_OK) {
+        session->flags = session_info.flags;
+        session->state = session_info.state;
+    }
+    return ret;
 }
 
 static void token_session_close(P11PROV_SESSION *session)
@@ -93,6 +104,7 @@ static void token_session_close(P11PROV_SESSION *session)
         /* regardless of the result the session is gone */
         session->session = CK_INVALID_HANDLE;
         session->flags = DEFLT_SESSION_FLAGS;
+        session->state = CK_UNAVAILABLE_INFORMATION;
     }
 }
 
@@ -183,6 +195,7 @@ void p11prov_session_pool_fork_reset(P11PROV_SESSION_POOL *pool)
 
             session->session = CK_INVALID_HANDLE;
             session->flags = DEFLT_SESSION_FLAGS;
+            session->state = CK_UNAVAILABLE_INFORMATION;
             session->in_use = false;
             session->cb = NULL;
             session->cbarg = NULL;
@@ -228,6 +241,7 @@ static CK_RV session_new_bare(P11PROV_SESSION_POOL *pool,
     session->slotid = pool->slotid;
     session->session = CK_INVALID_HANDLE;
     session->flags = DEFLT_SESSION_FLAGS;
+    session->state = CK_UNAVAILABLE_INFORMATION;
     session->pool = pool;
 
     ret = MUTEX_INIT(session);
@@ -289,8 +303,7 @@ static CK_RV session_new(P11PROV_SESSION_POOL *pool, P11PROV_SESSION **_session)
     return CKR_OK;
 }
 
-static CK_RV session_check(P11PROV_SESSION *session, CK_FLAGS flags,
-                           CK_STATE *state)
+static CK_RV session_check(P11PROV_SESSION *session, CK_FLAGS flags)
 {
     CK_SESSION_INFO session_info;
     int ret;
@@ -313,21 +326,19 @@ static CK_RV session_check(P11PROV_SESSION *session, CK_FLAGS flags,
     ret = p11prov_GetSessionInfo(session->provctx, session->session,
                                  &session_info);
     if (ret == CKR_OK) {
-        if (state) {
-            *state = session_info.state;
-        }
+        session->state = session_info.state;
         if (flags == session_info.flags) {
-            return ret;
+            return CKR_OK;
         }
         (void)p11prov_CloseSession(session->provctx, session->session);
-        session->session = CK_INVALID_HANDLE;
         /* tell the caller that the session was closed so they can
          * keep up with accounting */
-        return CKR_SESSION_CLOSED;
+        ret = CKR_SESSION_CLOSED;
     }
 
     /* session has been closed elsewhere, or otherwise unusable */
     session->session = CK_INVALID_HANDLE;
+    session->state = CK_UNAVAILABLE_INFORMATION;
     return ret;
 }
 
@@ -376,10 +387,49 @@ CK_SLOT_ID p11prov_session_slotid(P11PROV_SESSION *session)
     return session->slotid;
 }
 
+static int p11prov_session_prompt_for_pin(struct p11prov_slot *slot,
+                                          char *cb_pin, size_t *cb_pin_len)
+{
+    char *prompt = NULL;
+    UI *ui = UI_new_method(NULL);
+    const char *login_info = p11prov_slot_get_login_info(slot);
+    int ret;
+
+    P11PROV_debug("Starting internal PIN prompt slot=%p", slot);
+
+    if (ui == NULL) {
+        ret = RET_OSSL_ERR;
+        goto err;
+    }
+    prompt = UI_construct_prompt(ui, "PIN", login_info);
+    if (!prompt) {
+        ret = RET_OSSL_ERR;
+        goto err;
+    }
+    ret = UI_dup_input_string(ui, prompt, UI_INPUT_FLAG_DEFAULT_PWD, cb_pin, 4,
+                              MAX_PIN_LENGTH);
+    if (ret <= 0) {
+        ret = RET_OSSL_ERR;
+        goto err;
+    }
+
+    if (UI_process(ui)) {
+        ret = RET_OSSL_ERR;
+        goto err;
+    }
+
+    *cb_pin_len = strlen(cb_pin);
+
+err:
+    OPENSSL_free(prompt);
+    UI_free(ui);
+    return ret;
+}
+
 /* returns a locked login_session if _session is not NULL */
 static CK_RV token_login(P11PROV_SESSION *session, P11PROV_URI *uri,
                          OSSL_PASSPHRASE_CALLBACK *pw_cb, void *pw_cbarg,
-                         struct p11prov_slot *slot)
+                         struct p11prov_slot *slot, CK_USER_TYPE user_type)
 {
     char cb_pin[MAX_PIN_LENGTH + 1] = { 0 };
     size_t cb_pin_len = 0;
@@ -388,6 +438,9 @@ static CK_RV token_login(P11PROV_SESSION *session, P11PROV_URI *uri,
     CK_TOKEN_INFO *token;
     bool cache = false;
     CK_RV ret;
+
+    P11PROV_debug("Log into the token session=%p uri=%p slot=%p type=%lu",
+                  session, uri, slot, user_type);
 
     token = p11prov_slot_get_token(slot);
     if (!(token->flags & CKF_PROTECTED_AUTHENTICATION_PATH)) {
@@ -410,18 +463,39 @@ static CK_RV token_login(P11PROV_SESSION *session, P11PROV_URI *uri,
         }
         if (pin) {
             pinlen = strlen((const char *)pin);
-        } else if (pw_cb) {
-            const char *login_info = p11prov_slot_get_login_info(slot);
-            OSSL_PARAM params[2] = {
-                OSSL_PARAM_DEFN(OSSL_PASSPHRASE_PARAM_INFO,
-                                OSSL_PARAM_UTF8_STRING, (void *)login_info,
-                                strlen(login_info)),
-                OSSL_PARAM_END,
-            };
-            ret = pw_cb(cb_pin, sizeof(cb_pin), &cb_pin_len, params, pw_cbarg);
-            if (ret != RET_OSSL_OK) {
-                ret = CKR_GENERAL_ERROR;
-                goto done;
+        } else {
+            if (pw_cb) {
+                const char *login_info = p11prov_slot_get_login_info(slot);
+                OSSL_PARAM params[2] = {
+                    OSSL_PARAM_DEFN(OSSL_PASSPHRASE_PARAM_INFO,
+                                    OSSL_PARAM_UTF8_STRING, (void *)login_info,
+                                    strlen(login_info)),
+                    OSSL_PARAM_END,
+                };
+                ret = pw_cb(cb_pin, sizeof(cb_pin), &cb_pin_len, params,
+                            pw_cbarg);
+                if (ret != RET_OSSL_OK) {
+                    /* this error can mean anything from the user canceling
+                     * the prompt to no UI method provided.
+                     * Fall back to our prompt here */
+                    ret = p11prov_session_prompt_for_pin(slot, (char *)cb_pin,
+                                                         &cb_pin_len);
+                    if (ret != RET_OSSL_OK) {
+                        /* give up */
+                        ret = CKR_GENERAL_ERROR;
+                        goto done;
+                    }
+                }
+            } else {
+                /* We are asking the user off-band for the user consent -- from
+                 * store we will always receive non-null (but unusable) callback
+                 */
+                ret = p11prov_session_prompt_for_pin(slot, (char *)cb_pin,
+                                                     &cb_pin_len);
+                if (ret != RET_OSSL_OK) {
+                    ret = CKR_GENERAL_ERROR;
+                    goto done;
+                }
             }
             if (cb_pin_len == 0) {
                 ret = CKR_CANCEL;
@@ -432,16 +506,12 @@ static CK_RV token_login(P11PROV_SESSION *session, P11PROV_URI *uri,
             pinlen = cb_pin_len;
 
             cache = p11prov_ctx_cache_pins(session->provctx);
-
-        } else {
-            ret = CKR_CANCEL;
-            goto done;
         }
     }
 
     P11PROV_debug("Attempt Login on session %lu", session->session);
     /* Supports only USER login sessions for now */
-    ret = p11prov_Login(session->provctx, session->session, CKU_USER, pin,
+    ret = p11prov_Login(session->provctx, session->session, user_type, pin,
                         pinlen);
     if (ret == CKR_USER_ALREADY_LOGGED_IN) {
         ret = CKR_OK;
@@ -467,6 +537,36 @@ static CK_RV token_login(P11PROV_SESSION *session, P11PROV_URI *uri,
 
 done:
     OPENSSL_cleanse(cb_pin, cb_pin_len);
+    return ret;
+}
+
+CK_RV p11prov_context_specific_login(P11PROV_SESSION *session, P11PROV_URI *uri,
+                                     OSSL_PASSPHRASE_CALLBACK *pw_cb,
+                                     void *pw_cbarg)
+{
+    P11PROV_SLOTS_CTX *sctx = NULL;
+    P11PROV_SLOT *slot = NULL;
+    CK_RV ret;
+
+    P11PROV_debug("Providing context specific login session=%p uri=%p", session,
+                  uri);
+
+    ret = p11prov_take_slots(session->provctx, &sctx);
+    if (ret != CKR_OK) {
+        return CKR_GENERAL_ERROR;
+    }
+
+    slot = p11prov_get_slot_by_id(sctx, p11prov_session_slotid(session));
+    if (!slot) {
+        ret = CKR_GENERAL_ERROR;
+        goto done;
+    }
+
+    ret =
+        token_login(session, uri, pw_cb, pw_cbarg, slot, CKU_CONTEXT_SPECIFIC);
+
+done:
+    p11prov_return_slots(sctx);
     return ret;
 }
 
@@ -509,6 +609,19 @@ static CK_RV check_slot(P11PROV_CTX *ctx, P11PROV_SLOT *slot, P11PROV_URI *uri,
     return CKR_OK;
 }
 
+static bool is_login_state(CK_STATE state)
+{
+    switch (state) {
+    case CKS_RO_USER_FUNCTIONS:
+    case CKS_RW_USER_FUNCTIONS:
+    case CKS_RW_SO_FUNCTIONS:
+        return true;
+    default:
+        break;
+    }
+    return false;
+}
+
 static CK_RV fetch_session(P11PROV_SESSION_POOL *pool, CK_FLAGS flags,
                            bool login_session, P11PROV_SESSION **_session)
 {
@@ -526,7 +639,11 @@ static CK_RV fetch_session(P11PROV_SESSION_POOL *pool, CK_FLAGS flags,
         ret = MUTEX_LOCK(pool->login_session);
         if (ret == CKR_OK) {
             if (pool->login_session->in_use) {
-                ret = CKR_CANT_LOCK;
+                if (is_login_state(pool->login_session->state)) {
+                    ret = CKR_USER_ALREADY_LOGGED_IN;
+                } else {
+                    ret = CKR_CANT_LOCK;
+                }
             } else {
                 session = pool->login_session;
                 session->in_use = true;
@@ -604,32 +721,47 @@ done:
     return ret;
 }
 
+/* sleep interval, 5 microseconds */
+#define LOCK_SLEEP 5000
 static CK_RV slot_login(P11PROV_SLOT *slot, P11PROV_URI *uri,
                         OSSL_PASSPHRASE_CALLBACK *pw_cb, void *pw_cbarg,
-                        P11PROV_SESSION **_session)
+                        bool reqlogin, P11PROV_SESSION **_session)
 {
     P11PROV_SESSION_POOL *pool = p11prov_slot_get_session_pool(slot);
     P11PROV_SESSION *session = NULL;
     CK_FLAGS flags = DEFLT_SESSION_FLAGS;
-    CK_STATE state = CKS_RO_PUBLIC_SESSION;
     int num_open_sessions = 0;
     CK_RV ret;
 
     /* try to get a login_session */
     ret = fetch_session(pool, flags, true, &session);
+    if (ret == CKR_USER_ALREADY_LOGGED_IN && _session == NULL) {
+        P11PROV_debug("A login session already exists");
+        return CKR_OK;
+    }
+
     if (ret != CKR_OK) {
-        P11PROV_raise(pool->provctx, ret, "Failed to fetch a login_session");
-        return ret;
+        if (reqlogin) {
+            /* try a few times to get a login session,
+             * but eventually timeout if it doesn't work to avoid deadlocks */
+            uint64_t startime = 0;
+            do {
+                ret = fetch_session(pool, flags, true, &session);
+                if (ret == CKR_OK) {
+                    break;
+                }
+            } while (cyclewait_with_timeout(MAX_WAIT, LOCK_SLEEP, &startime));
+        }
+
+        if (ret != CKR_OK) {
+            P11PROV_raise(pool->provctx, ret, "Failed to fetch login_session");
+            return ret;
+        }
     }
 
     /* we acquired the session, check that it is ok */
-    ret = session_check(session, session->flags, &state);
-    if (ret == CKR_OK) {
-        if (state != CKS_RO_PUBLIC_SESSION) {
-            /* we seem to have a valid logged in session */
-            goto done;
-        }
-    } else {
+    ret = session_check(session, session->flags);
+    if (ret != CKR_OK) {
         num_open_sessions--;
     }
 
@@ -642,7 +774,12 @@ static CK_RV slot_login(P11PROV_SLOT *slot, P11PROV_URI *uri,
         }
     }
 
-    ret = token_login(session, uri, pw_cb, pw_cbarg, slot);
+    if (is_login_state(session->state)) {
+        /* we seem to already have a valid logged in session */
+        ret = CKR_OK;
+    } else {
+        ret = token_login(session, uri, pw_cb, pw_cbarg, slot, CKU_USER);
+    }
 
 done:
     /* lock the pool only if needed */
@@ -675,6 +812,12 @@ done:
         p11prov_return_session(session);
     }
     return ret;
+}
+
+static bool check_skip_login(P11PROV_CTX *ctx, P11PROV_SLOT *slot)
+{
+    return p11prov_ctx_login_behavior(ctx) != PUBKEY_LOGIN_ALWAYS
+           && !p11prov_slot_check_req_login(slot);
 }
 
 /* There are three possible ways to call this function.
@@ -734,8 +877,8 @@ CK_RV p11prov_get_session(P11PROV_CTX *provctx, CK_SLOT_ID *slotid,
         if (ret != CKR_OK) {
             goto done;
         }
-        if (reqlogin) {
-            ret = slot_login(slot, uri, pw_cb, pw_cbarg, NULL);
+        if (reqlogin && !check_skip_login(provctx, slot)) {
+            ret = slot_login(slot, uri, pw_cb, pw_cbarg, reqlogin, NULL);
             if (ret != CKR_OK) {
                 goto done;
             }
@@ -768,8 +911,8 @@ CK_RV p11prov_get_session(P11PROV_CTX *provctx, CK_SLOT_ID *slotid,
                 /* keep going */
                 continue;
             }
-            if (reqlogin) {
-                ret = slot_login(slot, uri, pw_cb, pw_cbarg, NULL);
+            if (reqlogin && !check_skip_login(provctx, slot)) {
+                ret = slot_login(slot, uri, pw_cb, pw_cbarg, reqlogin, NULL);
                 if (ret != CKR_OK) {
                     /* keep going */
                     continue;
@@ -818,7 +961,7 @@ CK_RV p11prov_get_session(P11PROV_CTX *provctx, CK_SLOT_ID *slotid,
 
     ret = fetch_session(pool, flags, false, &session);
     if (ret == CKR_OK) {
-        ret = session_check(session, flags, NULL);
+        ret = session_check(session, flags);
         if (ret != CKR_OK) {
             num_open_sessions--;
             ret = CKR_OK;
@@ -881,7 +1024,7 @@ CK_RV p11prov_take_login_session(P11PROV_CTX *provctx, CK_SLOT_ID slotid,
         goto done;
     }
 
-    ret = slot_login(slot, NULL, NULL, NULL, _session);
+    ret = slot_login(slot, NULL, NULL, NULL, false, _session);
 
 done:
     p11prov_return_slots(slots);
@@ -903,22 +1046,16 @@ void p11prov_return_session(P11PROV_SESSION *session)
     pool = session->pool;
 
     if (pool) {
-        /* peek at the pool lockless worst case we waste some time */
-        if (pool->open_sessions >= pool->max_cached_sessions) {
-            /* not much we can do if this fails,
-             * but only accounting will be a bit off */
-
-            /* LOCKED SECTION ------------- */
-            if (MUTEX_LOCK(pool) == CKR_OK) {
-                if (pool->open_sessions >= pool->max_cached_sessions
-                    && session != pool->login_session) {
-                    token_session_close(session);
-                    pool->open_sessions--;
-                }
-                (void)MUTEX_UNLOCK(pool);
+        /* LOCKED SECTION ------------- */
+        if (MUTEX_LOCK(pool) == CKR_OK) {
+            if (pool->open_sessions >= pool->max_cached_sessions
+                && session != pool->login_session) {
+                token_session_close(session);
+                pool->open_sessions--;
             }
-            /* ------------- LOCKED SECTION */
+            (void)MUTEX_UNLOCK(pool);
         }
+        /* ------------- LOCKED SECTION */
     }
 
     ret = MUTEX_LOCK(session);

@@ -18,8 +18,6 @@ struct p11prov_ctx {
         P11PROV_IN_ERROR,
     } status;
 
-    pthread_rwlock_t rwlock;
-
     /* Provider handles */
     const OSSL_CORE_HANDLE *handle;
     OSSL_LIB_CTX *libctx;
@@ -36,6 +34,8 @@ struct p11prov_ctx {
 
     /* cfg quirks */
     bool no_deinit;
+    bool no_allowed_mechanisms;
+    bool no_operation_state;
 
     /* module handles and data */
     P11PROV_MODULE *module;
@@ -50,6 +50,7 @@ struct p11prov_ctx {
     OSSL_ALGORITHM *op_asym_cipher;
     OSSL_ALGORITHM *op_encoder;
 
+    pthread_rwlock_t quirk_lock;
     struct quirk *quirks;
     int nquirks;
 };
@@ -120,6 +121,7 @@ static void fork_child(void)
         if (ctx_pool.contexts[i]->status == P11PROV_INITIALIZED) {
             /* can't re-init in the fork handler, mark it */
             ctx_pool.contexts[i]->status = P11PROV_NEEDS_REINIT;
+            p11prov_module_mark_reinit(ctx_pool.contexts[i]->module);
             p11prov_slot_fork_reset(ctx_pool.contexts[i]->slots);
         }
     }
@@ -238,7 +240,7 @@ CK_RV p11prov_ctx_get_quirk(P11PROV_CTX *ctx, CK_SLOT_ID id, const char *name,
     int lock;
     CK_RV ret;
 
-    lock = pthread_rwlock_rdlock(&ctx->rwlock);
+    lock = pthread_rwlock_rdlock(&ctx->quirk_lock);
     if (lock != 0) {
         ret = CKR_CANT_LOCK;
         P11PROV_raise(ctx, ret, "Failure to rdlock! (%d)", errno);
@@ -279,7 +281,7 @@ CK_RV p11prov_ctx_get_quirk(P11PROV_CTX *ctx, CK_SLOT_ID id, const char *name,
     ret = CKR_OK;
 
 done:
-    lock = pthread_rwlock_unlock(&ctx->rwlock);
+    lock = pthread_rwlock_unlock(&ctx->quirk_lock);
     if (lock != 0) {
         P11PROV_raise(ctx, CKR_CANT_LOCK, "Failure to unlock! (%d)", errno);
         /* we do not return an error in this case, as we got the info */
@@ -327,7 +329,7 @@ CK_RV p11prov_ctx_set_quirk(P11PROV_CTX *ctx, CK_SLOT_ID id, const char *name,
         memcpy(_data, data, _size);
     }
 
-    lock = pthread_rwlock_wrlock(&ctx->rwlock);
+    lock = pthread_rwlock_wrlock(&ctx->quirk_lock);
     if (lock != 0) {
         ret = CKR_CANT_LOCK;
         P11PROV_raise(ctx, ret, "Failure to wrlock! (%d)", errno);
@@ -378,7 +380,7 @@ CK_RV p11prov_ctx_set_quirk(P11PROV_CTX *ctx, CK_SLOT_ID id, const char *name,
 
 done:
     P11PROV_debug("Set quirk '%s' of size %lu", name, size);
-    lock = pthread_rwlock_unlock(&ctx->rwlock);
+    lock = pthread_rwlock_unlock(&ctx->quirk_lock);
     if (lock != 0) {
         P11PROV_raise(ctx, CKR_CANT_LOCK, "Failure to unlock! (%d)", errno);
         /* we do not return an error in this case, as we got the info */
@@ -389,6 +391,43 @@ failed:
         OPENSSL_clear_free(_data, _size);
     }
     return ret;
+}
+
+CK_RV p11prov_token_sup_attr(P11PROV_CTX *ctx, CK_SLOT_ID id, int action,
+                             CK_ATTRIBUTE_TYPE attr, CK_BBOOL *data)
+{
+    CK_ULONG data_size = sizeof(CK_BBOOL);
+    void *data_ptr = &data;
+    char alloc_name[32];
+    const char *name;
+    int err;
+
+    switch (attr) {
+    case CKA_ALLOWED_MECHANISMS:
+        if (ctx->no_allowed_mechanisms) {
+            if (action == GET_ATTR) {
+                *data = false;
+            }
+            return CKR_OK;
+        }
+        name = "sup_attr_CKA_ALLOWED_MECHANISMS";
+        break;
+    default:
+        err = snprintf(alloc_name, 32, "sup_attr_%016lx", attr);
+        if (err < 0 || err >= 32) {
+            return CKR_HOST_MEMORY;
+        }
+        name = alloc_name;
+    }
+
+    switch (action) {
+    case GET_ATTR:
+        return p11prov_ctx_get_quirk(ctx, id, name, data_ptr, &data_size);
+    case SET_ATTR:
+        return p11prov_ctx_set_quirk(ctx, id, name, data, data_size);
+    default:
+        return CKR_ARGUMENTS_BAD;
+    }
 }
 
 P11PROV_INTERFACE *p11prov_ctx_get_interface(P11PROV_CTX *ctx)
@@ -476,13 +515,6 @@ static void p11prov_ctx_free(P11PROV_CTX *ctx)
 {
     int ret;
 
-    ret = pthread_rwlock_wrlock(&ctx->rwlock);
-    if (ret != 0) {
-        P11PROV_raise(ctx, CKR_CANT_LOCK,
-                      "Failure to wrlock! Data corruption may happen (%d)",
-                      errno);
-    }
-
     if (ctx->no_deinit) {
         ctx->status = P11PROV_NO_DEINIT;
     }
@@ -510,6 +542,13 @@ static void p11prov_ctx_free(P11PROV_CTX *ctx)
     p11prov_module_free(ctx->module);
     ctx->module = NULL;
 
+    ret = pthread_rwlock_wrlock(&ctx->quirk_lock);
+    if (ret != 0) {
+        P11PROV_raise(ctx, CKR_CANT_LOCK,
+                      "Failure to wrlock! Data corruption may happen (%d)",
+                      errno);
+    }
+
     if (ctx->quirks) {
         for (int i = 0; i < ctx->nquirks; i++) {
             OPENSSL_free(ctx->quirks[i].name);
@@ -521,22 +560,23 @@ static void p11prov_ctx_free(P11PROV_CTX *ctx)
         OPENSSL_free(ctx->quirks);
     }
 
-    /* remove from pool */
-    context_rm_pool(ctx);
-
-    ret = pthread_rwlock_unlock(&ctx->rwlock);
+    ret = pthread_rwlock_unlock(&ctx->quirk_lock);
     if (ret != 0) {
         P11PROV_raise(ctx, CKR_CANT_LOCK,
                       "Failure to unlock! Data corruption may happen (%d)",
                       errno);
     }
 
-    ret = pthread_rwlock_destroy(&ctx->rwlock);
+    ret = pthread_rwlock_destroy(&ctx->quirk_lock);
     if (ret != 0) {
         P11PROV_raise(ctx, CKR_CANT_LOCK,
                       "Failure to free lock! Data corruption may happen (%d)",
                       errno);
     }
+
+    /* remove from pool */
+    context_rm_pool(ctx);
+
     OPENSSL_clear_free(ctx, sizeof(P11PROV_CTX));
 }
 
@@ -568,6 +608,20 @@ int p11prov_ctx_cache_sessions(P11PROV_CTX *ctx)
 {
     P11PROV_debug("cache_sessions = %d", ctx->cache_sessions);
     return ctx->cache_sessions;
+}
+
+bool p11prov_ctx_no_operation_state(P11PROV_CTX *ctx)
+{
+    return ctx->no_operation_state;
+}
+
+CK_INFO p11prov_ctx_get_ck_info(P11PROV_CTX *ctx)
+{
+    if (!ctx->module) {
+        CK_INFO info = { 0 };
+        return info;
+    }
+    return p11prov_module_ck_info(ctx->module);
 }
 
 static void p11prov_teardown(void *ctx)
@@ -1272,7 +1326,7 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH *in,
     }
     ctx->handle = handle;
 
-    ret = pthread_rwlock_init(&ctx->rwlock, NULL);
+    ret = pthread_rwlock_init(&ctx->quirk_lock, NULL);
     if (ret != 0) {
         ret = errno;
         P11PROV_debug("rwlock init failed (%d)", ret);
@@ -1299,6 +1353,19 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH *in,
         return ret;
     }
 
+    P11PROV_debug("Provided config params:");
+    for (int i = 0; i < P11PROV_CFG_SIZE; i++) {
+        const char none[] = "[none]";
+        const char pin[] = "[****]";
+        const char *val = none;
+        if (i == P11PROV_CFG_TOKEN_PIN) {
+            val = pin;
+        } else if (cfg[i]) {
+            val = cfg[i];
+        }
+        P11PROV_debug("  %s: %s", p11prov_cfg_names[i].name, val);
+    }
+
     ret = p11prov_module_new(ctx, cfg[P11PROV_CFG_PATH],
                              cfg[P11PROV_CFG_INIT_ARGS], &ctx->module);
     if (ret != CKR_OK) {
@@ -1315,6 +1382,7 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH *in,
             return RET_OSSL_ERR;
         }
     }
+    P11PROV_debug("PIN %savailable", ctx->pin ? "" : "not ");
 
     if (cfg[P11PROV_CFG_ALLOW_EXPORT] != NULL) {
         char *end = NULL;
@@ -1328,6 +1396,7 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH *in,
             return RET_OSSL_ERR;
         }
     }
+    P11PROV_debug("Export %sallowed", ctx->allow_export == 1 ? "not " : "");
 
     if (cfg[P11PROV_CFG_LOGIN_BEHAVIOR] != NULL) {
         if (strcmp(cfg[P11PROV_CFG_LOGIN_BEHAVIOR], "auto") == 0) {
@@ -1344,11 +1413,26 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH *in,
             return RET_OSSL_ERR;
         }
     }
+    switch (ctx->login_behavior) {
+    case PUBKEY_LOGIN_AUTO:
+        P11PROV_debug("Login behavior: auto");
+        break;
+    case PUBKEY_LOGIN_ALWAYS:
+        P11PROV_debug("Login behavior: always");
+        break;
+    case PUBKEY_LOGIN_NEVER:
+        P11PROV_debug("Login behavior: never");
+        break;
+    default:
+        P11PROV_debug("Login behavior: <invalid>");
+        break;
+    }
 
     if (cfg[P11PROV_CFG_CACHE_PINS] != NULL
         && strcmp(cfg[P11PROV_CFG_CACHE_PINS], "cache") == 0) {
         ctx->cache_pins = true;
     }
+    P11PROV_debug("PINs will %sbe cached", ctx->cache_pins ? "" : "not ");
 
     if (cfg[P11PROV_CFG_CACHE_KEYS] != NULL) {
         if (strcmp(cfg[P11PROV_CFG_CACHE_KEYS], "true") == 0) {
@@ -1360,11 +1444,55 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH *in,
         /* defaults to session */
         ctx->cache_keys = P11PROV_CACHE_KEYS_IN_SESSION;
     }
+    switch (ctx->cache_keys) {
+    case P11PROV_CACHE_KEYS_NEVER:
+        P11PROV_debug("Key caching: never");
+        break;
+    case P11PROV_CACHE_KEYS_IN_SESSION:
+        P11PROV_debug("Key caching: in session object");
+        break;
+    }
 
     if (cfg[P11PROV_CFG_QUIRKS] != NULL) {
-        if (strcmp(cfg[P11PROV_CFG_QUIRKS], "no-deinit") == 0) {
-            ctx->no_deinit = true;
+        const char *str;
+        const char *sep;
+        size_t len = strlen(cfg[P11PROV_CFG_QUIRKS]);
+        size_t toklen;
+
+        str = cfg[P11PROV_CFG_QUIRKS];
+        while (str) {
+            sep = strchr(str, ' ');
+            if (sep) {
+                toklen = sep - str;
+            } else {
+                toklen = len;
+            }
+            if (strncmp(str, "no-deinit", toklen) == 0) {
+                ctx->no_deinit = true;
+            } else if (strncmp(str, "no-allowed-mechanisms", toklen) == 0) {
+                ctx->no_allowed_mechanisms = true;
+            } else if (strncmp(str, "no-operation-state", toklen) == 0) {
+                ctx->no_operation_state = true;
+            }
+            len -= toklen;
+            if (sep) {
+                str = sep + 1;
+                len--;
+            } else {
+                str = NULL;
+            }
         }
+    }
+    if (ctx->no_deinit || ctx->no_allowed_mechanisms) {
+        P11PROV_debug("Quirks:");
+        if (ctx->no_deinit) {
+            P11PROV_debug(" No finalization on de-initialization");
+        }
+        if (ctx->no_allowed_mechanisms) {
+            P11PROV_debug(" No CKA_ALLOWED_MECHANISM use");
+        }
+    } else {
+        P11PROV_debug("No quirks");
     }
 
     if (cfg[P11PROV_CFG_CACHE_SESSIONS] != NULL) {
@@ -1383,6 +1511,7 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH *in,
     } else {
         ctx->cache_sessions = MAX_CACHE_SESSIONS;
     }
+    P11PROV_debug("Cache Sessions: %d", ctx->cache_sessions);
 
     /* PAY ATTENTION: do this as the last thing */
     if (cfg[P11PROV_CFG_LOAD_BEHAVIOR] != NULL
@@ -1394,6 +1523,8 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH *in,
             return RET_OSSL_ERR;
         }
     }
+    P11PROV_debug("Load behavior: %s",
+                  ctx->status == P11PROV_UNINITIALIZED ? "default" : "early");
 
     /* done */
     ret = RET_OSSL_OK;

@@ -90,6 +90,11 @@ int main(int argc, char *argv[])
     int status;
 
     keyuri = getenv("PRIURI");
+    /* optional first argument is a PKCS#11 uri of the key to test.
+     * Default is provided by environment variable BASEURI */
+    if (argc > 1) {
+        keyuri = argv[1];
+    }
     if (!keyuri) {
         fprintf(stderr, "PRIURI not defined\n");
         exit(EXIT_FAILURE);
@@ -121,6 +126,7 @@ int main(int argc, char *argv[])
             fprintf(stderr, "Invalid data from store\n");
             exit(EXIT_FAILURE);
         }
+        OSSL_STORE_INFO_free(info);
     }
 
     OSSL_STORE_close(store);
@@ -140,6 +146,8 @@ int main(int argc, char *argv[])
 
     if (pid == 0) {
         sign_op(key);
+        EVP_PKEY_free(key);
+        UI_destroy_method(ui_method);
         PRINTERR("Child Done\n");
         exit(EXIT_SUCCESS);
     }
@@ -151,6 +159,7 @@ int main(int argc, char *argv[])
     }
 
     EVP_PKEY_free(key);
+    UI_destroy_method(ui_method);
     PRINTERR("ALL A-OK!\n");
     exit(EXIT_SUCCESS);
 }

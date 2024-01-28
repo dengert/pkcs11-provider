@@ -4,12 +4,20 @@
 #ifndef _INTERFACE_H
 #define _INTERFACE_H
 
+#if P11PROV_ADDRESS_SANITIZER
+/* address sanitizer does not play well with the RTLD_DEEPBIND */
+#define P11PROV_DLOPEN_FLAGS RTLD_NOW | RTLD_LOCAL
+#else
+#define P11PROV_DLOPEN_FLAGS RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND
+#endif
+
 /* interface declarations for PKCS#11 wrapper functions */
 CK_RV p11prov_module_new(P11PROV_CTX *ctx, const char *path,
                          const char *init_args, P11PROV_MODULE **_mctx);
 CK_RV p11prov_module_init(P11PROV_MODULE *mctx);
 P11PROV_INTERFACE *p11prov_module_get_interface(P11PROV_MODULE *mctx);
 void p11prov_module_free(P11PROV_MODULE *mctx);
+void p11prov_module_mark_reinit(P11PROV_MODULE *mctx);
 CK_RV p11prov_module_reinit(P11PROV_MODULE *mctx);
 CK_RV p11prov_Initialize(P11PROV_CTX *ctx, CK_VOID_PTR pInitArgs);
 CK_RV p11prov_Finalize(P11PROV_CTX *ctx, CK_VOID_PTR pReserved);
@@ -118,5 +126,13 @@ CK_RV p11prov_SeedRandom(P11PROV_CTX *ctx, CK_SESSION_HANDLE hSession,
                          CK_BYTE_PTR SeedData, CK_ULONG ulSeedLen);
 CK_RV p11prov_GenerateRandom(P11PROV_CTX *ctx, CK_SESSION_HANDLE hSession,
                              CK_BYTE_PTR RandomData, CK_ULONG ulRandomLen);
+
+/* Special side-channel free path against PKCS#1 1.5 side channel leaking */
+CK_RV side_channel_free_Decrypt(P11PROV_CTX *ctx, CK_SESSION_HANDLE hSession,
+                                CK_BYTE_PTR pEncryptedData,
+                                CK_ULONG ulEncryptedDataLen, CK_BYTE_PTR pData,
+                                CK_ULONG_PTR pulDataLen);
+
+CK_INFO p11prov_module_ck_info(P11PROV_MODULE *mctx);
 
 #endif /* _INTERFACE_H */

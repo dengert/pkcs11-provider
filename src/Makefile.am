@@ -10,9 +10,6 @@ noinst_HEADERS = \
 	kdf.h \
 	keymgmt.h \
 	interface.h \
-	oasis/pkcs11.h \
-	oasis/pkcs11f.h \
-	oasis/pkcs11t.h \
 	objects.h \
 	pkcs11.h \
 	platform/endian.h \
@@ -57,7 +54,7 @@ EXTRA_DIST = \
 	$(NULL)
 
 pkcs11_la_CFLAGS = $(AM_CFLAGS) $(OPENSSL_CFLAGS) -Wall -Werror
-pkcs11_la_LIBADD = $(OPENSSL_LIBS)
+pkcs11_la_LIBADD = $(CRYPTO_LIBS)
 
 pkcs11_la_LDFLAGS = \
 	$(AM_LDFLAGS) -module \

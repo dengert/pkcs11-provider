@@ -2,7 +2,7 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.69])
-AC_INIT([pkcs11-provider], [0.1], [simo@redhat.com])
+AC_INIT([pkcs11-provider], [0.3], [simo@redhat.com])
 AC_CONFIG_SRCDIR([src/provider.c])
 AC_CONFIG_HEADERS([src/config.h])
 AM_INIT_AUTOMAKE([foreign dist-xz -Wall -Werror])
@@ -18,6 +18,8 @@ AX_CHECK_COMPILE_FLAG([-std=c11],
                       [CFLAGS="$CFLAGS -std=c11"],
                       AC_MSG_ERROR([C compiler must support at least C11 standard])
 )
+
+AX_VALGRIND_CHECK()
 
 STD_CFLAGS="-Wall -Wextra -Wwrite-strings -Wpointer-arith -Wno-missing-field-initializers -Wformat -Wshadow"
 
@@ -58,11 +60,18 @@ AC_ARG_WITH([openssl],
       CFLAGS="-I$OPENSSL_DIR/include $CFLAGS"
       LDFLAGS="-L${libcrypto_path} ${LDFLAGS}"
       LIBS="$LIBS -L${libcrypto_path}"
+      CRYPTO_LIBS="-lcrypto"
       OPENSSL_LIBS="-lcrypto -lssl"
       AC_MSG_WARN([Custom openssl located in $OPENSSL_DIR is used, lib version check is skipped])
   ],
   [
       # Checks for libraries.
+      PKG_CHECK_MODULES(
+        [CRYPTO],
+        [libcrypto >= 3.0.7],
+        ,
+        [AC_MSG_ERROR([libcrypto >= 3.0.7 is required])]
+      )
       PKG_CHECK_MODULES(
         [OPENSSL],
         [libcrypto >= 3.0.7, libssl],
@@ -70,6 +79,29 @@ AC_ARG_WITH([openssl],
         [AC_MSG_ERROR([libcrypto >= 3.0.7 is required])]
       )
   ])
+
+address_sanitizer_path="no"
+AC_MSG_CHECKING(for --with-address-sanitizer)
+AC_ARG_WITH(address_sanitizer,
+  AS_HELP_STRING([--with-address-sanitizer=yes|path_to_libasan.so],
+                 [Enable Address Sanitizer @<:@default=no@:>@]),
+  [
+      address_sanitizer_path=${withval}
+      CFLAGS="-fsanitize=address -fno-omit-frame-pointer $CFLAGS"
+      LDFLAGS="-fsanitize=address $LDFLAGS"
+  ],
+  [
+      address_sanitizer_path="no"
+  ])
+AS_IF([test "x$address_sanitizer_path" != "xno"],
+      [AS_IF([test "x$address_sanitizer_path" == "xyes"],
+             [address_sanitizer_path=`realpath $($CC -print-file-name=libasan.so)`],
+             [])],
+      [])
+
+AC_MSG_RESULT($address_sanitizer_path)
+AM_CONDITIONAL([ADDRESS_SANITIZER], [test x${address_sanitizer_path} != xno])
+AC_SUBST(ADDRESS_SANITIZER_PATH, "$address_sanitizer_path")
 
 AC_SUBST([SHARED_EXT], $(eval echo "${shrext_cmds}"))
 
@@ -96,11 +128,13 @@ PKG_CHECK_EXISTS(
         )]
 )
 
-AC_CHECK_FILE($SOFTOKENDIR/libsoftokn3$SHARED_EXT, [],
-    [AC_CHECK_FILE($SOFTOKENDIR/nss/libsoftokn3$SHARED_EXT,
-        [AC_SUBST([SOFTOKEN_SUBDIR], "nss/")],
-        [AC_MSG_WARN([Softoken library missing, tests will fail!])])
-    ])
+if ! test -f $SOFTOKENDIR/libsoftokn3$SHARED_EXT; then
+    if test -f $SOFTOKENDIR/nss/libsoftokn3$SHARED_EXT; then
+        AC_SUBST([SOFTOKEN_SUBDIR], "nss/")
+    else
+        AC_MSG_WARN([Softoken library missing, tests will fail!])
+    fi
+fi
 
 # find p11-kit-client to separate softhsm openssl context from our tests
 PKG_CHECK_EXISTS([p11-kit-1],
@@ -127,6 +161,7 @@ AC_CHECK_FUNCS([strpbrk])
 
 AC_CONFIG_FILES([
 	Makefile
+	docs/Makefile
 	src/Makefile
 	tests/Makefile
 ])

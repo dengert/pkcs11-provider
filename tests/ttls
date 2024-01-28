@@ -2,53 +2,61 @@
 # Copyright (C) 2023 Simo Sorce <simo@redhat.com>
 # SPDX-License-Identifier: Apache-2.0
 
-source ${TESTSSRCDIR}/helpers.sh
+source "${TESTSSRCDIR}/helpers.sh"
 
 title PARA "Test SSL_CTX creation"
-./tlsctx
+$CHECKER ./tlsctx
 
 title PARA "Test an actual TLS connection"
-rm -f ${TMPPDIR}/s_server_input
-rm -f ${TMPPDIR}/s_server_output
 
-# Set up command fifo
-mkfifo ${TMPPDIR}/s_server_input
-exec 3<>${TMPPDIR}/s_server_input
+rm -f "${TMPPDIR}/s_server_output"
+rm -f "${TMPPDIR}/s_server_ready"
+mkfifo "${TMPPDIR}/s_server_ready"
 
-#Make sure we terminate programs if test fails in the middle
-trap 'jobs -p | xargs -r kill >/dev/null 2>&1 || true' EXIT
+SERVER_PID=-1
+# Make sure we terminate programs if test fails in the middle
+# shellcheck disable=SC2317  # Shellcheck for some reason does not follow trap
+wait_for_server_at_exit() {
+    wait "$1"
+    echo "Server output:"
+    cat "${TMPPDIR}/s_server_output"
+}
+trap 'wait_for_server_at_exit $SERVER_PID;' EXIT
 
-openssl s_server -accept 12345 -key ${PRIURI} -cert ${CRTURI} <&3 &
+PORT=23456
 
-# Wait a sec to make sure server is up before client tries to connect
-sleep 0.5
+expect -c "spawn $CHECKER openssl s_server -accept \"${PORT}\" -naccept 1 -key \"${PRIURI}\" -cert \"${CRTURI}\";
+    set timeout 60;
+    expect {
+        \"ACCEPT\" {};
+        default {exit 1;};
+    }
+    set server_ready [open \"${TMPPDIR}/s_server_ready\" w+];
+    puts \$server_ready \"READY\n\";
+    close \$server_ready;
+    expect {
+        \"END SSL SESSION PARAMETERS\" {};
+        default {exit 1;};
+    }
+    send \" TLS SUCCESSFUL \n\"
+    send \"Q\n\"
+    expect {
+        eof {exit 0;};
+        default {exit 1;};
+    }" > "${TMPPDIR}/s_server_output" &
+SERVER_PID=$!
 
-# The client will error when the server drops the connection
-set +e
-openssl s_client -connect localhost:12345 -quiet > ${TMPPDIR}/s_server_output &
-set -e
+read -r < "${TMPPDIR}/s_server_ready"
 
-# Wait to make sure client is connected
-sleep 0.5
+expect -c "spawn $CHECKER openssl s_client -connect \"localhost:${PORT}\";
+    set timeout 60;
+    expect {
+        \" TLS SUCCESSFUL \" {};
+        default {exit 1;};
+    }
+    expect {
+        eof {exit 0;};
+        default {exit 1;};
+    }"
 
-# Send command to the client
-echo " TLS SUCCESSFUL " >&3
-
-# s_server seem to be confused if Q comes in too early
-sleep 0.5
-
-echo "Q" >&3
-
-# Tear down command fifo
-exec 3>&-
-rm -f ${TMPPDIR}/s_server_input
-
-echo "Check message was successfully delivered over TLS"
-grep " TLS SUCCESSFUL " ${TMPPDIR}/s_server_output
-
-#Make sure there is enough time for the server to tear down the port
-#To avoid interference with other tests
-sleep 0.5
-
-exit 0
-
+exit 0;

@@ -22,6 +22,7 @@
 #include <openssl/proverr.h>
 #include <openssl/core_names.h>
 #include <openssl/provider.h>
+#include <openssl/ui.h>
 
 #define UNUSED __attribute__((unused))
 #define RET_OSSL_OK 1
@@ -57,8 +58,8 @@
 #define P11PROV_NAMES_RAND "PKCS11-RAND"
 #define P11PROV_DESCS_RAND "PKCS11 Random Generator"
 
-#define P11PROV_PARAM_KEY_LABEL "pkcs11_key_label"
-#define P11PROV_PARAM_KEY_ID "pkcs11_key_id"
+#define P11PROV_PARAM_URI "pkcs11_uri"
+#define P11PROV_PARAM_KEY_USAGE "pkcs11_key_usage"
 #define P11PROV_PARAM_SLOT_ID "pkcs11_slot_id"
 
 typedef struct p11prov_ctx P11PROV_CTX;
@@ -72,6 +73,15 @@ typedef struct p11prov_session P11PROV_SESSION;
 typedef struct p11prov_session_pool P11PROV_SESSION_POOL;
 typedef struct p11prov_obj_pool P11PROV_OBJ_POOL;
 
+#if __SANITIZE_ADDRESS__
+#define P11PROV_ADDRESS_SANITIZER 1
+#endif
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define P11PROV_ADDRESS_SANITIZER 1
+#endif
+#endif
+
 /* Provider ctx */
 P11PROV_INTERFACE *p11prov_ctx_get_interface(P11PROV_CTX *ctx);
 CK_UTF8CHAR_PTR p11prov_ctx_pin(P11PROV_CTX *ctx);
@@ -83,6 +93,10 @@ CK_RV p11prov_ctx_get_quirk(P11PROV_CTX *ctx, CK_SLOT_ID id, const char *name,
                             void **data, CK_ULONG *size);
 CK_RV p11prov_ctx_set_quirk(P11PROV_CTX *ctx, CK_SLOT_ID id, const char *name,
                             void *data, CK_ULONG size);
+#define GET_ATTR 0
+#define SET_ATTR 1
+CK_RV p11prov_token_sup_attr(P11PROV_CTX *ctx, CK_SLOT_ID id, int action,
+                             CK_ATTRIBUTE_TYPE attr, CK_BBOOL *data);
 
 #define ALLOW_EXPORT_PUBLIC 0
 #define DISALLOW_EXPORT_PUBLIC 1
@@ -100,6 +114,10 @@ enum p11prov_cache_keys {
 };
 int p11prov_ctx_cache_keys(P11PROV_CTX *ctx);
 int p11prov_ctx_cache_sessions(P11PROV_CTX *ctx);
+
+bool p11prov_ctx_no_operation_state(P11PROV_CTX *ctx);
+
+CK_INFO p11prov_ctx_get_ck_info(P11PROV_CTX *ctx);
 
 #include "debug.h"
 

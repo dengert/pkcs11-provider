@@ -2,7 +2,7 @@
 # Copyright (C) 2022 Jakub Jelen <jjelen@redhat.com>
 # SPDX-License-Identifier: Apache-2.0
 
-source ${TESTSSRCDIR}/helpers.sh
+source "${TESTSSRCDIR}/helpers.sh"
 
 if ! command -v softhsm2-util &> /dev/null
 then
@@ -19,7 +19,6 @@ if [ "$(uname)" == "Darwin" ]; then
     certtool=$(type -p gnutls-certtool)
 else
     certtool=$(type -p certtool)
-    sed_backup=""
 fi
 if [ -z "$certtool" ]; then
     echo "Missing GnuTLS certtool (on macOS, commonly installed as gnutls-certtool)"
@@ -89,7 +88,7 @@ mkdir ${TMPPDIR}
 
 PINVALUE="12345678"
 PINFILE="${PWD}/pinfile.txt"
-echo ${PINVALUE} > ${PINFILE}
+echo ${PINVALUE} > "${PINFILE}"
 
 #RANDOM data
 SEEDFILE="${TMPPDIR}/noisefile.bin"
@@ -134,7 +133,7 @@ KEYID='0000'
 URIKEYID="%00%00"
 CACRT="${TMPPDIR}/CAcert"
 CACRTN="caCert"
-let "SERIAL+=1"
+((SERIAL+=1))
 pkcs11-tool --keypairgen --key-type="RSA:2048" --login --pin=$PINVALUE \
 	--module="$P11LIB" --label="${CACRTN}" --id="$KEYID"
 "${certtool}" --generate-self-signed --outfile="${CACRT}.crt" \
@@ -152,7 +151,7 @@ ca_sign() {
     LABEL=$2
     CN=$3
     KEYID=$4
-    let "SERIAL+=1"
+    ((SERIAL+=1))
     sed -e "s|cn = .*|cn = $CN|g" \
         -e "s|serial = .*|serial = $SERIAL|g" \
         -e "/^ca$/d" \
@@ -164,7 +163,7 @@ ca_sign() {
         --load-pubkey "pkcs11:object=$LABEL;type=public" --outder \
         --load-ca-certificate "${CACRT}.crt" --inder \
         --load-ca-privkey="pkcs11:object=$CACRTN;type=private"
-    pkcs11-tool --write-object "${CRT}.crt" --type=cert --id=$KEYID \
+    pkcs11-tool --write-object "${CRT}.crt" --type=cert --id="$KEYID" \
         --label="$LABEL" --module="$P11LIB"
 
 }
@@ -254,7 +253,6 @@ EDPRIURI="pkcs11:type=private;id=${URIKEYID}"
 EDCRTURI="pkcs11:type=cert;object=${EDCRTN}"
 
 title LINE "ED25519 PKCS11 URIS"
-echo "${EDBASEURIWITHPIN}"
 echo "${EDBASEURI}"
 echo "${EDPUBURI}"
 echo "${EDPRIURI}"
@@ -307,6 +305,55 @@ echo "${ECPRI2URI}"
 echo "${ECCRT2URI}"
 echo ""
 
+if [ -f /etc/fedora-release ]; then
+    title PARA "explicit EC unsupported on Fedora"
+else
+    title PARA "generate explicit EC key pair"
+    KEYID='0007'
+    URIKEYID="%00%07"
+    ECXCRTN="ecExplicitCert"
+
+    pkcs11-tool --write-object="${TESTSSRCDIR}/explicit_ec.key.der" --type=privkey --login --pin=$PINVALUE \
+        --module="$P11LIB" --label="${ECXCRTN}" --id="$KEYID"
+    pkcs11-tool --write-object="${TESTSSRCDIR}/explicit_ec.pub.der" --type=pubkey --login --pin=$PINVALUE \
+        --module="$P11LIB" --label="${ECXCRTN}" --id="$KEYID"
+
+    ECXBASEURIWITHPIN="pkcs11:id=${URIKEYID};pin-value=${PINVALUE}"
+    ECXBASEURI="pkcs11:id=${URIKEYID}"
+    ECXPUBURI="pkcs11:type=public;id=${URIKEYID}"
+    ECXPRIURI="pkcs11:type=private;id=${URIKEYID}"
+
+    title LINE "EXPLICIT EC PKCS11 URIS"
+    echo "${ECXBASEURI}"
+    echo "${ECXPUBURI}"
+    echo "${ECXPRIURI}"
+    echo ""
+fi
+
+title PARA "generate EC key pair with ALWAYS AUTHENTICATE flag, self-signed certificate"
+KEYID='0008'
+URIKEYID="%00%08"
+TSTCRT="${TMPPDIR}/eccert3"
+TSTCRTN="ecCert3"
+
+pkcs11-tool --keypairgen --key-type="EC:secp521r1" --login --pin=$PINVALUE \
+	--module="$P11LIB" --label="${TSTCRTN}" --id="$KEYID" --always-auth
+ca_sign $TSTCRT $TSTCRTN "My EC Cert 3" $KEYID
+
+ECBASE3URIWITHPIN="pkcs11:id=${URIKEYID};pin-value=${PINVALUE}"
+ECBASE3URI="pkcs11:id=${URIKEYID}"
+ECPUB3URI="pkcs11:type=public;id=${URIKEYID}"
+ECPRI3URI="pkcs11:type=private;id=${URIKEYID}"
+ECCRT3URI="pkcs11:type=cert;object=${TSTCRTN}"
+
+title LINE "EC3 PKCS11 URIS"
+echo "${ECBASE3URIWITHPIN}"
+echo "${ECBASE3URI}"
+echo "${ECPUB3URI}"
+echo "${ECPRI3URI}"
+echo "${ECCRT3URI}"
+echo ""
+
 title PARA "Show contents of softhsm token"
 echo " ----------------------------------------------------------------------------------------------------"
 pkcs11-tool -O --login --pin=$PINVALUE --module="$P11LIB"
@@ -323,7 +370,7 @@ sed -e "s|@libtoollibs[@]|${LIBSPATH}|g" \
     -e "s|@SHARED_EXT@|${SHARED_EXT}|g" \
     -e "s|##QUIRKS|pkcs11-module-quirks = no-deinit|g" \
     -e "/pkcs11-module-init-args/d" \
-    ${TESTSSRCDIR}/openssl.cnf.in > ${OPENSSL_CONF}
+    "${TESTSSRCDIR}/openssl.cnf.in" > "${OPENSSL_CONF}"
 
 title LINE "Export test variables to ${TMPPDIR}/testvars"
 cat >> ${TMPPDIR}/testvars <<DBGSCRIPT
@@ -370,10 +417,29 @@ export BASE2URI="${BASE2URI}"
 export PRI2URI="${PRI2URI}"
 export CRT2URI="${CRT2URI}"
 
-export ECBASE2URIWITHPIN="${ECBASEURIWITHPIN}"
+export ECBASE2URIWITHPIN="${ECBASE2URIWITHPIN}"
 export ECBASE2URI="${ECBASE2URI}"
 export ECPRI2URI="${ECPRI2URI}"
 export ECCRT2URI="${ECCRT2URI}"
+
+export ECBASE3URIWITHPIN="${ECBASE3URIWITHPIN}"
+export ECBASE3URI="${ECBASE3URI}"
+export ECPUB3URI="${ECPUB3URI}"
+export ECPRI3URI="${ECPRI3URI}"
+export ECCRT3URI="${ECCRT3URI}"
+DBGSCRIPT
+
+if [ -n "${ECXBASEURI}" ]; then
+    cat >> ${TMPPDIR}/testvars <<DBGSCRIPT
+
+export ECXBASEURIWITHPIN="${ECXBASEURIWITHPIN}"
+export ECXBASEURI="${ECXBASEURI}"
+export ECXPUBURI="${ECXPUBURI}"
+export ECXPRIURI="${ECXPRIURI}"
+DBGSCRIPT
+fi
+
+cat >> ${TMPPDIR}/testvars <<DBGSCRIPT
 
 # for listing the separate pkcs11 calls
 #export PKCS11SPY="${PKCS11_PROVIDER_MODULE}"
